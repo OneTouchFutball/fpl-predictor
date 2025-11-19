@@ -5,12 +5,36 @@ import numpy as np
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="FPL Pro Predictor 25/26", page_icon="⚽", layout="wide")
+
+# --- CUSTOM CSS (THE "GOOD" STYLING) ---
 st.markdown("""
 <style>
-    .stTabs [data-baseweb="tab-list"] { gap: 10px; }
-    .stTabs [data-baseweb="tab"] { height: 50px; white-space: pre-wrap; background-color: #f0f2f6; border-radius: 5px; }
-    .stTabs [data-baseweb="tab"][aria-selected="true"] { background-color: #e6ffe6; border: 1px solid #00cc00; }
-    .stButton button { width: 100%; }
+    /* Increase Tab Size and Font */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        height: 60px;
+        white-space: pre-wrap;
+        background-color: #f0f2f6;
+        border-radius: 8px 8px 0 0;
+        padding: 10px 20px;
+        font-size: 18px; /* Bigger Text */
+        font-weight: 700; /* Bold */
+        color: #4a4a4a;
+    }
+    .stTabs [data-baseweb="tab"]:hover {
+        background-color: #e0e2e6;
+        color: #1f77b4;
+    }
+    .stTabs [data-baseweb="tab"][aria-selected="true"] {
+        background-color: #ffffff;
+        border-top: 3px solid #00cc00;
+        color: #00cc00;
+        box-shadow: 0 -2px 5px rgba(0,0,0,0.05);
+    }
+    /* Button Styling */
+    .stButton button { width: 100%; font-weight: 600; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -124,26 +148,28 @@ def main():
         "Price Importance (Value vs Raw Points)", 
         0.0, 1.0, 0.5,
         help="0.0 = Best Players Only. 1.0 = Best Value Only.",
-        on_change=reset_page
+        on_change=reset_page,
+        key="price_weight"
     )
     
     # ATTRIBUTE WEIGHTS
     st.sidebar.subheader("Metric Weights")
     with st.sidebar.expander("GK & Defender Settings", expanded=False):
-        w_cs = st.slider("Clean Sheet Potential", 0.1, 1.0, 0.5, on_change=reset_page)
-        w_ppm_def = st.slider("Points Per Match (DEF)", 0.1, 1.0, 0.5, on_change=reset_page)
-        w_fix_def = st.slider("Fixture Favourability (DEF)", 0.1, 1.0, 0.5, on_change=reset_page)
+        w_cs = st.slider("Clean Sheet Potential", 0.1, 1.0, 0.5, on_change=reset_page, key="def_cs")
+        w_ppm_def = st.slider("Points Per Match (DEF)", 0.1, 1.0, 0.5, on_change=reset_page, key="def_ppm")
+        w_fix_def = st.slider("Fixture Favourability (DEF)", 0.1, 1.0, 0.5, on_change=reset_page, key="def_fix")
 
     with st.sidebar.expander("Mid & Attacker Settings", expanded=False):
-        w_xgi = st.slider("Total xGI Threat", 0.1, 1.0, 0.5, on_change=reset_page)
-        w_ppm_att = st.slider("Points Per Match (ATT)", 0.1, 1.0, 0.5, on_change=reset_page)
-        w_fix_att = st.slider("Fixture Favourability (ATT)", 0.1, 1.0, 0.5, on_change=reset_page)
+        w_xgi = st.slider("Total xGI Threat", 0.1, 1.0, 0.5, on_change=reset_page, key="att_xgi")
+        w_ppm_att = st.slider("Points Per Match (ATT)", 0.1, 1.0, 0.5, on_change=reset_page, key="att_ppm")
+        w_fix_att = st.slider("Fixture Favourability (ATT)", 0.1, 1.0, 0.5, on_change=reset_page, key="att_fix")
 
     st.sidebar.divider()
     min_minutes = st.sidebar.slider(
         "Min. Minutes Played", 0, 2000, 0, 
         help="Set to 0 to analyze ALL players.",
-        on_change=reset_page
+        on_change=reset_page,
+        key="min_mins"
     )
 
     # --- ANALYSIS ---
@@ -167,6 +193,7 @@ def main():
                 if price <= 0: price = 4.0
                 
                 if is_defense:
+                    # GK/DEF Logic
                     stat_val = float(p['clean_sheets_per_90'])
                     stat_label = stat_val 
                     
@@ -177,6 +204,7 @@ def main():
                     base_strength = (ppm * 0.7) + (stat_val * 6 * 0.3)
 
                 else:
+                    # MID/FWD Logic
                     stat_val = float(p.get('expected_goal_involvements_per_90', 0))
                     stat_label = stat_val
                     
@@ -284,7 +312,13 @@ def main():
                 st.rerun()
 
     # --- RENDER TABS ---
-    tab_gk, tab_def, tab_mid, tab_fwd = st.tabs(["🧤 GK", "🛡️ DEF", "⚔️ MID", "⚽ FWD"])
+    # Using the Uppercase Names to match the bold CSS style
+    tab_gk, tab_def, tab_mid, tab_fwd = st.tabs([
+        "🧤 GOALKEEPERS", 
+        "🛡️ DEFENDERS", 
+        "⚔️ MIDFIELDERS", 
+        "⚽ FORWARDS"
+    ])
 
     with tab_gk: render_tab([1], True)
     with tab_def: render_tab([2], True)
