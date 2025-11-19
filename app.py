@@ -166,7 +166,7 @@ def main():
 
     st.sidebar.divider()
     min_minutes = st.sidebar.slider(
-        "Min. Minutes Played", 0, 2000, 0, 
+        "Min. Minutes Played", 0, 2000, 250, 
         help="Set to 0 to analyze ALL players.",
         on_change=reset_page,
         key="min_mins"
@@ -295,8 +295,8 @@ def main():
                 "Stat_Display": st.column_config.NumberColumn(stat_col_name, format="%.2f", help=f"{stat_col_name} stats from FPL API"),
                 "Upcoming Fixtures": st.column_config.TextColumn("Opponents", width="medium"),
                 "PPM": st.column_config.NumberColumn("Pts/G", format="%.1f"),
-                "Future Fix": st.column_config.NumberColumn("Fut Fix", help="Higher = Easier Upcoming"),
-                "Past Fix": st.column_config.NumberColumn("Past Fix", help="Higher = Easier Past"),
+                "Future Fix": st.column_config.NumberColumn("Fut Fix", help="Higher = Easier Upcoming Fixtures"),
+                "Past Fix": st.column_config.NumberColumn("Past Fix", help="Higher = Easier Past Fixtures"),
             },
             use_container_width=True
         )
@@ -327,4 +327,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
