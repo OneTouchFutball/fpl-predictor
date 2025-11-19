@@ -44,8 +44,7 @@ def process_fixtures(fixtures, teams_data):
     # Map ID to Short Name (e.g. 1 -> ARS)
     team_map = {t['id']: t['short_name'] for t in teams_data}
     
-    # Initialize structure: { team_id: { 'past': [], 'future': [] } }
-    # Items in lists will be dicts: {'diff_score': float, 'display': str}
+    # Initialize structure
     team_sched = {t['id']: {'past': [], 'future': []} for t in teams_data}
 
     for f in fixtures:
@@ -80,9 +79,7 @@ def process_fixtures(fixtures, teams_data):
 
 def get_aggregated_data(schedule_list, limit=None):
     """
-    Returns:
-    1. Average Favourability Score
-    2. String representation of opponents
+    Returns: Average Score, Display String
     """
     if not schedule_list:
         return 3.0, "-"
@@ -111,8 +108,8 @@ def normalize_scores(df, target_col):
 
 # --- MAIN APP ---
 def main():
-    st.title("🧠 FPL Pro Predictor: ROI Engine")
-    st.markdown("### Advanced algorithmic prediction")
+    st.title("🧠 FPL Pro Predictor: True ROI Engine")
+    st.markdown("### Value identification based on Price, Future Fixtures, and Past Resistance.")
 
     data, fixtures = load_data()
     if not data or not fixtures:
@@ -140,9 +137,9 @@ def main():
 
     st.sidebar.divider()
     st.sidebar.header("⚖️ Model Weights")
-    st.sidebar.info("Defaults set to Equal (0.5). Adjust to bias the model.")
+    st.sidebar.info("All weights default to 0.5 (Equal).")
     
-    # Equalized Weights Default = 0.5
+    # Weights (Default 0.5)
     with st.sidebar.expander("GK & Defender Weights", expanded=True):
         w_cs = st.slider("Clean Sheet Potential", 0.1, 1.0, 0.5)
         w_ppm_def = st.slider("Points Per Match (DEF)", 0.1, 1.0, 0.5)
@@ -163,7 +160,10 @@ def main():
         for p in data['elements']:
             # Filters
             if p['element_type'] not in player_type_ids: continue
-            if p['status'] != 'a': continue
+            
+            # REMOVED: "if p['status'] != 'a': continue"
+            # Now includes Injured (i), Suspended (s), Doubtful (d)
+            
             if p['minutes'] < min_minutes: continue
 
             tid = p['team']
@@ -172,16 +172,16 @@ def main():
             past_data = team_schedule[tid]['past']
             future_data = team_schedule[tid]['future']
             
-            # Past (All played so far)
+            # Past (All played)
             past_score, _ = get_aggregated_data(past_data)
             
             # Future (Selected Horizon)
             future_score, future_display = get_aggregated_data(future_data, limit=horizon_option)
 
-            # 2. Player Stats
+            # 2. Player Stats & Price
             try:
                 ppm = float(p['points_per_game'])
-                cost = p['now_cost'] / 10.0
+                price = p['now_cost'] / 10.0
                 
                 if is_defense:
                     # DEF FORMULA
@@ -192,18 +192,29 @@ def main():
                     xgi = float(p.get('expected_goal_involvements_per_90', 0)) * 10
                     base_score = (xgi * w_xgi) + (ppm * w_ppm_att) + (future_score * w_fix_att)
 
-                # 3. RESISTANCE CALCULATION (ROI)
-                clamped_past = max(2.0, min(past_score, 5.0))
-                raw_roi = base_score / clamped_past
+                # 3. THE ROI CALCULATION
+                
+                # Step A: Adjust by Past Resistance
+                resistance_factor = max(2.0, min(past_score, 5.0))
+                context_score = base_score / resistance_factor
+                
+                # Step B: Adjust by Price (True ROI)
+                final_roi_score = context_score / price
+                
+                # Get Status Icon
+                status = p['status']
+                status_icon = "✅" if status == 'a' else ("⚠️" if status == 'd' else "❌")
+                name_display = f"{status_icon} {p['web_name']}"
 
                 candidates.append({
-                    "Name": p['web_name'],
+                    "Name": name_display,
                     "Team": team_names[tid],
-                    "Price": cost,
+                    "Price": price,
                     "Upcoming Fixtures": future_display,
                     "PPM": ppm,
-                    "Fix. Score": round(future_score, 2),
-                    "Raw Score": raw_roi
+                    "Fix. Score (Fut)": round(future_score, 2),
+                    "Fix. Score (Past)": round(past_score, 2),
+                    "Raw Score": final_roi_score
                 })
 
             except Exception as e:
@@ -215,8 +226,8 @@ def main():
             df = normalize_scores(df, "Raw Score")
             df = df.sort_values(by="ROI Index", ascending=False).head(30)
             
-            # Select Columns
-            cols = ["ROI Index", "Name", "Team", "Price", "Upcoming Fixtures", "PPM", "Fix. Score"]
+            # Select Display Columns
+            cols = ["ROI Index", "Name", "Team", "Price", "Upcoming Fixtures", "PPM", "Fix. Score (Fut)", "Fix. Score (Past)"]
             df = df[cols]
             
         return df
@@ -230,7 +241,7 @@ def main():
     col_config = {
         "ROI Index": st.column_config.ProgressColumn(
             "ROI Index", format="%.1f", min_value=1, max_value=10,
-            help="10 = High Potential relative to past performance."
+            help="Score derived from Performance ÷ Past Ease ÷ Price."
         ),
         "Price": st.column_config.NumberColumn("£", format="£%.1f"),
         "Upcoming Fixtures": st.column_config.TextColumn(
@@ -238,7 +249,9 @@ def main():
             width="large",
             help=f"Next {horizon_option} Opponents (H=Home, A=Away)"
         ),
-        "PPM": st.column_config.NumberColumn("Pts/Game", format="%.1f"),
+        "PPM": st.column_config.NumberColumn("Pts/G", format="%.1f"),
+        "Fix. Score (Fut)": st.column_config.NumberColumn("Fut Fix", help="Higher = Easier Upcoming Games"),
+        "Fix. Score (Past)": st.column_config.NumberColumn("Past Fix", help="Higher = Easier Past Games"),
     }
 
     # 1. GOALKEEPERS
