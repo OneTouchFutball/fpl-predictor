@@ -3,13 +3,16 @@ import requests
 import pandas as pd
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="FPL Pro Model v6 (PPM Integrated)", page_icon="⚽", layout="wide")
+st.set_page_config(page_title="FPL Explosion Model v7", page_icon="🧨", layout="wide")
 
 # --- CSS ---
 st.markdown("""
 <style>
     .stDataFrame { width: 100%; }
-    .stProgress > div > div > div > div { background-image: linear-gradient(to right, #37A158, #E8E135, #C43939); }
+    /* Custom Progress Bar Colors based on 1-10 scale */
+    .stProgress > div > div > div > div { 
+        background-image: linear-gradient(to right, #a83232, #d19630, #37a849); 
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -25,7 +28,7 @@ def load_data():
         return None, None
 
 def get_team_leakiness(static_data):
-    """Calculates Team xGC per 90."""
+    """Calculates Team xGC per 90. Used for Clean Sheet Potential."""
     team_xgc = {t['id']: [] for t in static_data['teams']}
     for p in static_data['elements']:
         if p['element_type'] in [1, 2] and p['minutes'] > 450:
@@ -51,85 +54,71 @@ def get_10_game_schedule(static_data, fixture_data):
             if len(schedule[a]) < 10: schedule[a].append({"opp": teams[h], "diff": f['team_a_difficulty']})
     return schedule
 
-# --- 2. SCORING ENGINES (UPDATED WITH PPM) ---
+# --- 2. SCORING ENGINES (EQUIVALENCE TUNED) ---
 
-def calc_attacker_score(p, schedule_map, w_ppm, w_xgi, w_form, w_fix):
+def calc_attacker_raw_score(p, schedule_map, w_ppm, w_xgi, w_form, w_fix):
     """
-    New Attacker Model.
-    Key Input: PPM (Points Per Match).
+    Raw Score Calculation for MID/FWD.
     """
     try:
-        # Metrics
         ppm = float(p['points_per_game'])
-        xgi = float(p.get('expected_goal_involvements', 0))
+        xgi = float(p.get('expected_goal_involvements', 0)) # Top players ~12-15
         form = float(p['form'])
         
-        # Schedule
         my_fixtures = schedule_map.get(p['team'], [])
-        if not my_fixtures: return 0, "", 0, 0
+        if not my_fixtures: return 0, "", 0
         avg_diff = sum(m['diff'] for m in my_fixtures) / len(my_fixtures)
         
-        # --- SCORING MATH (Normalized to ~10.0 scale) ---
+        # SCORING (Targeting raw max of ~25-30)
+        s_ppm = ppm * 2.0          # 9.0 PPM -> 18.0
+        s_xgi = xgi * 0.8          # 15 xGI -> 12.0
+        s_fix = (5.0 - avg_diff) * 3.0 # Diff 2 -> 9.0
+        s_form = form * 1.0        # Form 8 -> 8.0
         
-        # 1. PPM Score: A PPM of 9.0 is elite. We multiply by 1.2 to get ~10.8
-        s_ppm = ppm * 1.5
-        
-        # 2. xGI Score: Total xGI of 15 is elite. We multiply by 0.7 to get ~10.5
-        s_xgi = xgi * 0.7
-        
-        # 3. Fixture Score: (5 - Diff) * 3. 
-        # Easy schedule (Diff 2) -> Score 9.0
-        s_fix = (5.0 - avg_diff) * 3.0
-        
-        # 4. Form Score: Directly use form (usually 0-10)
-        s_form = form
-
-        # Weighted Sum
-        total = (s_ppm * w_ppm) + (s_xgi * w_xgi) + (s_form * w_form) + (s_fix * w_fix)
+        raw_score = (s_ppm * w_ppm) + (s_xgi * w_xgi) + (s_form * w_form) + (s_fix * w_fix)
         
         sched_str = ", ".join([f"{m['opp']}({m['diff']})" for m in my_fixtures])
-        return total, sched_str, avg_diff, ppm
-    except: return 0, "", 0, 0
+        return raw_score, sched_str, avg_diff
+    except: return 0, "", 0
 
-def calc_defender_score(p, schedule_map, leakiness_map, w_ppm, w_cs, w_fix, w_att):
+def calc_defender_raw_score(p, schedule_map, leakiness_map, w_ppm, w_cs, w_fix, w_att):
     """
-    New Defender Model.
-    Key Input: PPM (Captures bonus points and reliability).
+    Raw Score Calculation for DEF/GKP.
+    Tuned to output similar magnitude to Attackers.
     """
     try:
         ppm = float(p['points_per_game'])
-        xgi = float(p.get('expected_goal_involvements', 0))
-        team_xgc = leakiness_map.get(p['team'], 1.5)
+        xgi = float(p.get('expected_goal_involvements', 0)) # Defenders usually < 3.0
+        team_xgc = leakiness_map.get(p['team'], 1.5) # Range 0.8 to 2.5
         
         my_fixtures = schedule_map.get(p['team'], [])
-        if not my_fixtures: return 0, "", 0, 0
+        if not my_fixtures: return 0, "", 0
         avg_diff = sum(m['diff'] for m in my_fixtures) / len(my_fixtures)
         
-        # --- SCORING MATH ---
+        # SCORING
+        s_ppm = ppm * 2.0 # 6.0 PPM -> 12.0
         
-        # 1. PPM Score (Crucial for Trent/Gabriel/Saliba)
-        s_ppm = ppm * 1.5 
+        # EQUIVALENCE LOGIC:
+        # Attacker xGI max is ~15. 
+        # Best Team xGC is ~0.8. (3.0 - 0.8) = 2.2.
+        # To match Attacker xGI impact, we multiply Clean Sheet score by ~5.5
+        s_cs = (3.0 - team_xgc) * 5.5  # 2.2 * 5.5 -> 12.1 (Comparable to Attacker xGI)
         
-        # 2. Clean Sheet Prob (Inverted Team xGC)
-        s_cs = (3.0 - team_xgc) * 4.0
+        s_fix = (5.0 - avg_diff) * 3.5 
+        s_att = xgi * 2.5 # Bonus for Trent/Porro
         
-        # 3. Fixtures (High importance for CS)
-        s_fix = (5.0 - avg_diff) * 3.5
-        
-        # 4. Attacking Bonus
-        s_att = xgi * 2.0
-        
-        total = (s_ppm * w_ppm) + (s_cs * w_cs) + (s_fix * w_fix) + (s_att * w_att)
+        raw_score = (s_ppm * w_ppm) + (s_cs * w_cs) + (s_fix * w_fix) + (s_att * w_att)
         
         sched_str = ", ".join([f"{m['opp']}({m['diff']})" for m in my_fixtures])
-        return total, sched_str, avg_diff, ppm
-    except: return 0, "", 0, 0
+        return raw_score, sched_str, avg_diff
+    except: return 0, "", 0
 
 # --- 3. MAIN APP ---
 def main():
-    st.title("⚽ FPL Pro Model v6 (PPM Integrated)")
+    st.title("🧨 FPL Explosion Model v7")
+    st.markdown("**Unified ROI Index (1-10 Scale)** | **Attackers vs Defenders Equivalence**")
     
-    with st.spinner("Fetching live season data..."):
+    with st.spinner("Calibrating model data..."):
         static, fixtures = load_data()
         if not static: st.error("API Error"); return
         schedules = get_10_game_schedule(static, fixtures)
@@ -137,126 +126,149 @@ def main():
         teams = {t['id']: t['short_name'] for t in static['teams']}
 
     # --- SIDEBAR SETTINGS ---
-    st.sidebar.header("⚙️ Model Calibration")
+    st.sidebar.header("⚙️ Model Weights")
     
     with st.sidebar.expander("⚔️ Attacker Weights", expanded=True):
-        aw_ppm = st.slider("Points Per Match", 0.1, 1.0, 0.8, help="Impact of historical consistency (Haaland factor)")
-        aw_xgi = st.slider("Total xGI", 0.1, 1.0, 0.5, help="Impact of underlying stats")
+        aw_ppm = st.slider("Points Per Match", 0.1, 1.0, 0.9)
+        aw_xgi = st.slider("Total xGI", 0.1, 1.0, 0.7)
         aw_fix = st.slider("Fixture Ease (10 Gms)", 0.1, 1.0, 0.3)
-        aw_form = st.slider("Current Form", 0.1, 1.0, 0.2)
+        aw_form = st.slider("Form", 0.1, 1.0, 0.3)
     
-    with st.sidebar.expander("🛡️ Defender Weights", expanded=False):
-        dw_ppm = st.slider("Points Per Match", 0.1, 1.0, 0.7, key="dw1")
-        dw_cs = st.slider("Team CS Potential", 0.1, 1.0, 0.5, key="dw2")
+    with st.sidebar.expander("🛡️ Defender Weights", expanded=True):
+        dw_ppm = st.slider("Points Per Match", 0.1, 1.0, 0.8, key="dw1")
+        dw_cs = st.slider("Team CS Potential", 0.1, 1.0, 0.7, help="Equivalent to Attacker xGI in this model", key="dw2")
         dw_fix = st.slider("Fixture Ease", 0.1, 1.0, 0.4, key="dw3")
-        dw_att = st.slider("Attacking Threat", 0.1, 1.0, 0.2, key="dw4")
+        dw_att = st.slider("Attacking Threat", 0.1, 1.0, 0.3, key="dw4")
         
     min_mins = st.sidebar.number_input("Min Minutes Played", 0, 3000, 500)
 
-    # --- DATA PROCESSING LOOP ---
+    # --- PROCESS DATA & NORMALIZE SCORES ---
     all_players = []
     
+    # 1. Calculate Raw Scores
     for p in static['elements']:
         if p['minutes'] < min_mins: continue
         
         price = p['now_cost'] / 10.0
         pos = p['element_type']
-        
-        score = 0
+        raw_score = 0
         sched = ""
-        avg_diff = 0
-        ppm = 0
         category = ""
         
-        # Attackers
-        if pos in [3, 4]:
-            score, sched, avg_diff, ppm = calc_attacker_score(p, schedules, aw_ppm, aw_xgi, aw_form, aw_fix)
+        if pos in [3, 4]: # ATTACK
+            raw_score, sched, avg_diff = calc_attacker_raw_score(p, schedules, aw_ppm, aw_xgi, aw_form, aw_fix)
             category = "Attack"
-            
-        # Defenders
-        elif pos in [1, 2]:
-            score, sched, avg_diff, ppm = calc_defender_score(p, schedules, leakiness, dw_ppm, dw_cs, dw_fix, dw_att)
+        elif pos in [1, 2]: # DEFENSE
+            raw_score, sched, avg_diff = calc_defender_raw_score(p, schedules, leakiness, dw_ppm, dw_cs, dw_fix, dw_att)
             category = "Defense"
             
-        if score > 0:
+        if raw_score > 0:
             all_players.append({
                 "Name": p['web_name'],
                 "Team": teams[p['team']],
                 "Pos": {1:"GKP", 2:"DEF", 3:"MID", 4:"FWD"}[pos],
                 "Category": category,
                 "Price": price,
-                "PPM": ppm,
-                "Exp. Points": score, # The "Explosion Index"
+                "PPM": float(p['points_per_game']),
+                "Raw Score": raw_score,
                 "Schedule": sched
             })
 
     df_all = pd.DataFrame(all_players)
 
-    # --- UI TABS ---
-    tab_att, tab_def, tab_val = st.tabs(["⚔️ Attackers", "🛡️ Defenders", "💎 Value & ROI Engine"])
+    # 2. Normalize to 1-10 Scale (The "ROI Index")
+    if not df_all.empty:
+        max_raw = df_all['Raw Score'].max()
+        # Formula: 1 + (Raw / Max * 9) -> Ensures scale is 1.0 to 10.0
+        df_all['ROI Index'] = 1.0 + ((df_all['Raw Score'] / max_raw) * 9.0)
+    else:
+        st.error("No players found. Check API connection.")
+        return
 
-    # TAB 1: ATTACKERS
+    # --- TABS ---
+    tab_exp, tab_att, tab_def, tab_val = st.tabs([
+        "💥 Explosion Potential (All)", 
+        "⚔️ Attackers", 
+        "🛡️ Defenders", 
+        "💎 Best Value"
+    ])
+
+    # --- TAB 1: UNIFIED EXPLOSION POTENTIAL ---
+    with tab_exp:
+        st.markdown("### 💥 The Unified Leaderboard")
+        st.info("Ranking Goalkeepers, Defenders, Midfielders, and Forwards on one single **Explosion Scale (1-10)**.")
+        
+        # Sort by ROI Index
+        df_exp = df_all.sort_values("ROI Index", ascending=False).head(50)
+        
+        st.dataframe(df_exp, hide_index=True, use_container_width=True, column_config={
+            "ROI Index": st.column_config.ProgressColumn(
+                "Expected ROI Index", 
+                help="Scale 1-10. 10 = Elite Explosion Potential.",
+                format="%.1f", 
+                min_value=1, 
+                max_value=10
+            ),
+            "Pos": st.column_config.TextColumn("Pos"),
+            "PPM": st.column_config.NumberColumn("Pts/Match", format="%.1f"),
+            "Price": st.column_config.NumberColumn("£", format="£%.1f"),
+            "Schedule": st.column_config.TextColumn("Next 10 Fixtures", width="large")
+        })
+
+    # --- TAB 2: ATTACKERS ---
     with tab_att:
         df_att = df_all[df_all['Category'] == "Attack"].copy()
-        df_att = df_att.sort_values("Exp. Points", ascending=False).head(50)
+        df_att = df_att.sort_values("ROI Index", ascending=False).head(50)
+        
         st.dataframe(df_att, hide_index=True, use_container_width=True, column_config={
-            "Exp. Points": st.column_config.ProgressColumn("Predicted Points", format="%.1f", min_value=0, max_value=max(df_att['Exp. Points'])),
+            "ROI Index": st.column_config.ProgressColumn("Expected ROI Index", format="%.1f", min_value=1, max_value=10),
             "PPM": st.column_config.NumberColumn("Pts/Match", format="%.1f"),
             "Price": st.column_config.NumberColumn("£", format="£%.1f"),
             "Schedule": st.column_config.TextColumn("Next 10 Fixtures", width="large")
         })
 
-    # TAB 2: DEFENDERS
+    # --- TAB 3: DEFENDERS ---
     with tab_def:
         df_def = df_all[df_all['Category'] == "Defense"].copy()
-        df_def = df_def.sort_values("Exp. Points", ascending=False).head(50)
+        df_def = df_def.sort_values("ROI Index", ascending=False).head(50)
+        
         st.dataframe(df_def, hide_index=True, use_container_width=True, column_config={
-            "Exp. Points": st.column_config.ProgressColumn("Predicted Points", format="%.1f", min_value=0, max_value=max(df_def['Exp. Points'])),
+            "ROI Index": st.column_config.ProgressColumn("Expected ROI Index", format="%.1f", min_value=1, max_value=10),
             "PPM": st.column_config.NumberColumn("Pts/Match", format="%.1f"),
             "Price": st.column_config.NumberColumn("£", format="£%.1f"),
             "Schedule": st.column_config.TextColumn("Next 10 Fixtures", width="large")
         })
 
-    # TAB 3: VALUE ENGINE
+    # --- TAB 4: VALUE ENGINE ---
     with tab_val:
         st.markdown("### ⚖️ Weighted Decision Engine")
-        st.info("""
-        **Instructions:**
-        - **Points Priority = 100:** Ranking ignores price. Top players (Haaland/Salah) will be #1.
-        - **Points Priority = 50:** Finds the "Best Value" (ROI) players.
-        - **Points Priority = 0:** Finds the cheapest playable assets.
-        """)
+        st.info("Use the sliders to find players based on **Performance (ROI Index)** vs **Cost (Price)**.")
         
         c1, c2 = st.columns(2)
-        w_pts = c1.slider("Weight: Expected Points", 0, 100, 80, help="Set to 100 to see the absolute best players regardless of cost.")
-        w_price = c2.slider("Weight: Low Price", 0, 100, 20, help="Set higher to find budget gems.")
-
-        # --- NORMALIZATION LOGIC ---
+        w_roi_imp = c1.slider("Importance: Expected ROI Index", 0, 100, 70)
+        w_price_imp = c2.slider("Importance: Low Price", 0, 100, 30)
+        
         df_val = df_all.copy()
         
-        # Normalize Points (0 to 1)
-        max_pts = df_val['Exp. Points'].max()
-        df_val['n_pts'] = df_val['Exp. Points'] / max_pts
+        # 1. Normalize ROI Index (0 to 1) for calculation
+        # It's already 1-10, so (Val - 1) / 9
+        df_val['n_roi'] = (df_val['ROI Index'] - 1) / 9
         
-        # Normalize Price (0 to 1) - INVERTED (Low price = 1)
-        min_price = df_val['Price'].min()
-        max_price = df_val['Price'].max()
-        df_val['n_price'] = 1 - ((df_val['Price'] - min_price) / (max_price - min_price))
+        # 2. Normalize Price (0 to 1) - Inverted
+        min_p, max_p = df_val['Price'].min(), df_val['Price'].max()
+        df_val['n_price'] = 1 - ((df_val['Price'] - min_p) / (max_p - min_p))
         
-        # Final Score
-        # If w_pts is 100, we effectively ignore the price column
-        df_val['Value Index'] = (df_val['n_pts'] * w_pts) + (df_val['n_price'] * w_price)
+        # 3. Weighted Sum
+        df_val['Value Score'] = (df_val['n_roi'] * w_roi_imp) + (df_val['n_price'] * w_price_imp)
         
-        df_val = df_val.sort_values("Value Index", ascending=False).head(50)
+        df_val = df_val.sort_values("Value Score", ascending=False).head(50)
         
-        # Clean View
-        cols = ["Name", "Team", "Pos", "Price", "PPM", "Value Index", "Exp. Points", "Schedule"]
+        cols = ["Name", "Team", "Pos", "Price", "PPM", "Value Score", "ROI Index", "Schedule"]
         st.dataframe(df_val[cols], hide_index=True, use_container_width=True, column_config={
-            "Value Index": st.column_config.ProgressColumn("Value Score", format="%.0f", min_value=0, max_value=max(df_val['Value Index'])),
-            "Exp. Points": st.column_config.NumberColumn("Pred. Points", format="%.1f"),
-            "PPM": st.column_config.NumberColumn("Pts/Match", format="%.1f"),
+            "Value Score": st.column_config.ProgressColumn("Algorithm Score", format="%.0f"),
+            "ROI Index": st.column_config.NumberColumn("Exp. ROI (1-10)", format="%.1f"),
             "Price": st.column_config.NumberColumn("£", format="£%.1f"),
-            "Schedule": st.column_config.TextColumn("Next 10 Opponents", width="large")
+            "Schedule": st.column_config.TextColumn("Next 10 Fixtures", width="large")
         })
 
 if __name__ == "__main__":
