@@ -46,36 +46,81 @@ def load_data():
         return bootstrap, None
     return bootstrap, fixtures
 
-# --- LOGIC ENGINE ---
+# --- ADVANCED FIXTURE ENGINE (Home/Away Specific) ---
 def process_fixtures(fixtures, teams_data):
     team_map = {t['id']: t['short_name'] for t in teams_data}
+    
+    # Build Strength Map: ID -> {att_h, att_a, def_h, def_a}
+    strengths = {}
+    for t in teams_data:
+        strengths[t['id']] = {
+            'att_h': t['strength_attack_home'],
+            'att_a': t['strength_attack_away'],
+            'def_h': t['strength_defence_home'],
+            'def_a': t['strength_defence_away']
+        }
+
+    # Init Schedule: Stores TWO tracks (Attack Potential & Defense Potential)
     team_sched = {t['id']: {'past': [], 'future': []} for t in teams_data}
+
     for f in fixtures:
         if not f['kickoff_time']: continue
-        h, a = f['team_h'], f['team_a']
-        h_diff, a_diff = f['team_h_difficulty'], f['team_a_difficulty']
         
-        # Favourability: 6 - Difficulty + 0.5 Home Bonus
-        h_fav = (6 - h_diff) + 0.5
-        a_fav = (6 - a_diff)
+        h_id = f['team_h']
+        a_id = f['team_a']
         
-        h_obj = {'score': h_fav, 'display': f"{team_map[a]}(H)"}
-        a_obj = {'score': a_fav, 'display': f"{team_map[h]}(A)"}
+        # Get Strengths
+        h_str = strengths[h_id]
+        a_str = strengths[a_id]
+        
+        # --- CALCULATE MICRO-MATCHUP RATIOS ---
+        # Ratio > 1.0 = Advantage (Good Fixture)
+        # Ratio < 1.0 = Disadvantage (Bad Fixture)
+        
+        # 1. Home Team Perspective
+        # Home Attack vs Away Defense
+        h_att_ratio = h_str['att_h'] / a_str['def_a']
+        # Home Defense vs Away Attack
+        h_def_ratio = h_str['def_h'] / a_str['att_a']
+        
+        # 2. Away Team Perspective
+        # Away Attack vs Home Defense
+        a_att_ratio = a_str['att_a'] / h_str['def_h']
+        # Away Defense vs Home Attack
+        a_def_ratio = a_str['def_a'] / h_str['att_h']
+        
+        # Create Data Objects
+        # Format: {'att': float, 'def': float, 'display': str}
+        h_obj = {'att': h_att_ratio, 'def': h_def_ratio, 'display': f"{team_map[a_id]}(H)"}
+        a_obj = {'att': a_att_ratio, 'def': a_def_ratio, 'display': f"{team_map[h_id]}(A)"}
         
         if f['finished']:
-            team_sched[h]['past'].append(h_obj)
-            team_sched[a]['past'].append(a_obj)
+            team_sched[h_id]['past'].append(h_obj)
+            team_sched[a_id]['past'].append(a_obj)
         else:
-            team_sched[h]['future'].append(h_obj)
-            team_sched[a]['future'].append(a_obj)
+            team_sched[h_id]['future'].append(h_obj)
+            team_sched[a_id]['future'].append(a_obj)
+            
     return team_sched
 
-def get_aggregated_data(schedule_list, limit=None):
-    if not schedule_list: return 3.0, "-"
+def get_aggregated_data(schedule_list, limit=None, mode='att'):
+    """
+    Aggregates the specific 'mode' (att or def) from the schedule.
+    mode='att' -> For Attackers (Uses Attack vs Def ratio)
+    mode='def' -> For Defenders (Uses Def vs Att ratio)
+    """
+    if not schedule_list: return 1.0, "-" # 1.0 is neutral ratio
+    
     subset = schedule_list[:limit] if limit else schedule_list
-    avg_score = sum(item['score'] for item in subset) / len(subset)
+    
+    # Sum ratios and average them
+    # We multiply by 5 to map the Ratio (approx 0.5 to 1.5) to a Score (approx 2.5 to 7.5)
+    # This matches previous scaling logic for the ROI engine
+    avg_ratio = sum(item[mode] for item in subset) / len(subset)
+    scaled_score = avg_ratio * 5.0 
+    
     display_str = ", ".join([item['display'] for item in subset])
-    return avg_score, display_str
+    return scaled_score, display_str
 
 def min_max_scale(series):
     if series.empty: return series
@@ -86,7 +131,7 @@ def min_max_scale(series):
 # --- MAIN APP ---
 def main():
     st.title("🧠 FPL Pro Predictor: ROI Engine")
-    st.markdown("### Context-Aware Model (Stats adjusted for Schedule)")
+    st.markdown("### Context-Aware Model (Home/Away Strength vs Opponent Strength)")
 
     data, fixtures = load_data()
     if not data or not fixtures: return
@@ -95,9 +140,8 @@ def main():
     team_names = {t['id']: t['name'] for t in teams}
     team_schedule = process_fixtures(fixtures, teams)
     
-    team_conceded = {t['id']: t['strength_defence_home'] + t['strength_defence_away'] for t in teams}
-    max_str = max(team_conceded.values()) if team_conceded else 1
-    team_def_strength = {k: 10 - ((v/max_str)*10) + 5 for k,v in team_conceded.items()}
+    # We use team strength for calculating intrinsic CS potential
+    team_def_strength = {t['id']: (t['strength_defence_home'] + t['strength_defence_away'])/200 for t in teams} # Scale approx 10
 
     # --- SIDEBAR ---
     st.sidebar.header("🔮 Prediction Horizon")
@@ -153,92 +197,76 @@ def main():
         # Define FPL Point Values
         if pos_category in ["GK", "DEF"]:
             pts_goal, pts_cs, pts_assist = 6, 4, 3
+            # Select Defense Context for GKs/DEFs
+            context_mode = 'def'
         elif pos_category == "MID":
             pts_goal, pts_cs, pts_assist = 5, 1, 3
+            # Select Attack Context for Mids
+            context_mode = 'att'
         else: # FWD
             pts_goal, pts_cs, pts_assist = 4, 0, 3
+            # Select Attack Context for Fwds
+            context_mode = 'att'
 
         for p in data['elements']:
             if p['element_type'] not in player_type_ids: continue
             if p['minutes'] < min_minutes: continue
             tid = p['team']
             
-            # CONTEXT: Fixture Difficulty
-            past_score, _ = get_aggregated_data(team_schedule[tid]['past'])
-            future_score, future_display = get_aggregated_data(team_schedule[tid]['future'], limit=horizon_option)
+            # --- GET CONTEXTUAL FIXTURE SCORES ---
+            # Uses the specific mode ('att' or 'def') to get the correct Home/Away strength ratio
+            past_score, _ = get_aggregated_data(team_schedule[tid]['past'], mode=context_mode)
+            future_score, future_display = get_aggregated_data(team_schedule[tid]['future'], limit=horizon_option, mode=context_mode)
 
             try:
                 ppm = float(p['points_per_game'])
                 price = p['now_cost'] / 10.0
                 price = 4.0 if price <= 0 else price
                 
-                # Stats (xGI, xGC, etc.)
+                # Stats
                 xG = float(p.get('expected_goals_per_90', 0))
                 xA = float(p.get('expected_assists_per_90', 0))
                 xGI = float(p.get('expected_goal_involvements_per_90', 0))
-                xGC = float(p.get('expected_goals_conceded_per_90', 0)) # Added xGC
+                xGC = float(p.get('expected_goals_conceded_per_90', 0))
                 CS_rate = float(p.get('clean_sheets_per_90', 0))
                 
-                # --- COMPONENT SCORES (0-10 Scale) ---
+                # --- COMPONENT SCORES ---
                 
-                # 1. ATTACK SCORE (xG/xA/xGI)
+                # 1. ATTACK
                 raw_att_points = (xG * pts_goal) + (xA * pts_assist)
                 attack_score = min(10, raw_att_points * 8.0)
 
-                # 2. DEFENSE SCORE (CS_rate + xGC)
-                # FPL Logic: Low xGC is better.
-                # We create an "Inverse xGC Score": 
-                # 2.5 xGC/90 is terrible (0 score). 0.5 xGC/90 is elite.
-                inv_xgc_score = max(0, (2.5 - xGC) * 2.0) # Scale 0-5 approx
+                # 2. DEFENSE
+                # Inverse xGC Score
+                inv_xgc_score = max(0, (2.5 - xGC) * 2.0)
                 
                 team_factor = team_def_strength[tid] / 10.0 
-                
-                # Blend Clean Sheet history with Underlying xGC
                 def_raw = ((CS_rate * pts_cs) * 1.5) + inv_xgc_score
                 def_score = min(10, def_raw * team_factor)
 
                 # --- ROI SCORE CONSTRUCTION ---
-                
                 if pos_category == "GK":
-                    # GK relies on Def Score (CS + xGC) + Form
-                    base_score = (def_score * weights['cs']) + \
-                                 (ppm * weights['ppm']) + \
-                                 (future_score * weights['fix'])
-                                 
+                    base_score = (def_score * weights['cs']) + (ppm * weights['ppm']) + (future_score * weights['fix'])
                 elif pos_category == "DEF":
-                    base_score = (def_score * weights['cs']) + \
-                                 (attack_score * weights['xgi']) + \
-                                 (ppm * weights['ppm']) + \
-                                 (future_score * weights['fix'])
-                                 
+                    base_score = (def_score * weights['cs']) + (attack_score * weights['xgi']) + (ppm * weights['ppm']) + (future_score * weights['fix'])
                 else: # MID/FWD
-                    # Midfielders get slight penalty for High xGC (leakiness)
-                    # Forwards purely attack
                     def_component = def_score if pos_category == "MID" else 0
-                    base_score = (attack_score * weights['xgi']) + \
-                                 (ppm * weights['ppm']) + \
-                                 (future_score * weights['fix']) + \
-                                 (def_component * 0.1)
+                    base_score = (attack_score * weights['xgi']) + (ppm * weights['ppm']) + (future_score * weights['fix']) + (def_component * 0.1)
 
-                # --- THE CONTEXT RATIO (Context Aware Logic) ---
-                # Formula: (Future Ease / Past Ease)
-                # This effectively adjusts the 'Base Score' (which contains xGI/xGC).
+                # --- CONTEXT RATIO ---
+                # Ratio = Future Opportunity (Score based on Team Strength Ratio) / Past Resistance
                 
-                # Past Resistance (Low = Hard, High = Easy)
-                past_resistance = max(2.0, min(past_score, 5.0))
+                # Past: Low Score = Hard (Ratio < 1.0). High Score = Easy (Ratio > 1.0)
+                # Future: High Score = Easy.
                 
-                # Future Opportunity (Low = Hard, High = Easy)
-                future_opportunity = max(2.0, min(future_score, 5.0))
+                # We want: High Future + Low Past = Maximum Boost
+                past_resistance = max(2.0, min(past_score, 8.0)) # Clamp to avoid division by zero
+                future_opportunity = max(2.0, min(future_score, 8.0))
                 
-                # Ratio Calculation
-                # 1. Stat-Padding Check: High Past / Low Future = Penalty (<1.0)
-                # 2. Fixture Swing Check: Low Past / High Future = Boost (>1.0)
                 context_multiplier = future_opportunity / past_resistance
-                
-                # Dampen the effect slightly so it's not too volatile
                 weighted_multiplier = context_multiplier ** 1.2
                 
-                # Final ROI Calculation
+                # Apply to ROI
                 raw_perf_metric = base_score * weighted_multiplier
                 
                 status_icon = "✅" if p['status'] == 'a' else ("⚠️" if p['status'] == 'd' else "❌")
@@ -291,8 +319,8 @@ def main():
                 "Key Stat": st.column_config.NumberColumn(stat_label, format="%.2f"),
                 "Upcoming Fixtures": st.column_config.TextColumn("Opponents", width="medium"),
                 "PPM": st.column_config.NumberColumn("Pts/G", format="%.1f"),
-                "Future Fix": st.column_config.NumberColumn("Fut Fix", help="Higher = Easier"),
-                "Past Fix": st.column_config.NumberColumn("Past Fix", help="Higher = Easier"),
+                "Future Fix": st.column_config.NumberColumn("Fut Fix", help="Higher = Easier (Uses H/A Strength)"),
+                "Past Fix": st.column_config.NumberColumn("Past Fix", help="Higher = Easier (Uses H/A Strength)"),
             }
         )
         c1, _, c3 = st.columns([1, 2, 1])
