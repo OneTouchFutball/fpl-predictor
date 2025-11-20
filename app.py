@@ -46,16 +46,10 @@ def load_data():
         return bootstrap, None
     return bootstrap, fixtures
 
-# --- ADVANCED FIXTURE ENGINE ---
+# --- FIXTURE CONTEXT ENGINE ---
 def process_fixtures_with_context(fixtures, teams_data):
-    """
-    Calculates distinct Attacking and Defensive favourability scores based on
-    Home/Away splits and Opponent Strength.
-    """
     team_map = {t['id']: t['short_name'] for t in teams_data}
     
-    # Extract Team Strengths (Inverted logic: High Strength = Hard Opponent)
-    # We normalize roughly around 1000-1350 range provided by API
     t_stats = {}
     for t in teams_data:
         t_stats[t['id']] = {
@@ -65,74 +59,55 @@ def process_fixtures_with_context(fixtures, teams_data):
             'def_a': t['strength_defence_away']
         }
     
-    # Initialize Schedule Containers
-    # 'att_sched': How easy is it to ATTACK against this schedule?
-    # 'def_sched': How easy is it to DEFEND against this schedule?
     team_sched = {t['id']: {'past_att': [], 'fut_att': [], 'past_def': [], 'fut_def': []} for t in teams_data}
-
-    avg_strength = 1100.0 # Approximate league average strength metric
+    avg_strength = 1100.0 
 
     for f in fixtures:
         if not f['kickoff_time']: continue
         h, a = f['team_h'], f['team_a']
         
-        # --- CALCULATE FAVOURABILITY ---
-        # Score > 1.0 = Easy, Score < 1.0 = Hard
+        # --- LOGIC: CALCULATING RESISTANCE ---
+        # Higher Score = EASIER to play against.
         
-        # 1. FOR HOME TEAM (h)
-        # To Attack: We face Away Defense. Lower Opp Def = Easier.
-        # Logic: Avg / Opp_Def
-        h_att_fav = (avg_strength / t_stats[a]['def_a']) * 1.15 # +15% Home Boost
-        # To Defend: We face Away Attack. Lower Opp Att = Easier.
-        h_def_fav = (avg_strength / t_stats[a]['att_a']) * 1.10 # +10% Home Boost
+        # 1. HOME TEAM PERSPECTIVE
+        # Defending: Home Def vs Away Att (Higher = Easier)
+        h_def_fav = (avg_strength / t_stats[a]['att_a']) * 1.10
+        # Attacking: Home Att vs Away Def (Higher = Easier)
+        h_att_fav = (avg_strength / t_stats[a]['def_a']) * 1.15 
 
-        # 2. FOR AWAY TEAM (a)
-        # To Attack: We face Home Defense.
-        a_att_fav = (avg_strength / t_stats[h]['def_h']) * 0.9 # -10% Away Penalty
-        # To Defend: We face Home Attack.
-        a_def_fav = (avg_strength / t_stats[h]['att_h']) * 0.85 # -15% Away Penalty
+        # 2. AWAY TEAM PERSPECTIVE
+        # Defending: Away Def vs Home Att
+        a_def_fav = (avg_strength / t_stats[h]['att_h']) * 0.85 
+        # Attacking: Away Att vs Home Def
+        a_att_fav = (avg_strength / t_stats[h]['def_h']) * 0.90 
 
-        # Map to Display Strings
         h_disp = f"{team_map[a]}(H)"
         a_disp = f"{team_map[h]}(A)"
 
-        # Objects
-        h_att_obj = {'score': h_att_fav, 'display': h_disp}
-        h_def_obj = {'score': h_def_fav, 'display': h_disp}
-        
-        a_att_obj = {'score': a_att_fav, 'display': a_disp}
-        a_def_obj = {'score': a_def_fav, 'display': a_disp}
-
         if f['finished']:
-            team_sched[h]['past_att'].append(h_att_obj)
-            team_sched[h]['past_def'].append(h_def_obj)
-            team_sched[a]['past_att'].append(a_att_obj)
-            team_sched[a]['past_def'].append(a_def_obj)
+            team_sched[h]['past_att'].append({'score': h_att_fav, 'display': h_disp})
+            team_sched[h]['past_def'].append({'score': h_def_fav, 'display': h_disp})
+            team_sched[a]['past_att'].append({'score': a_att_fav, 'display': a_disp})
+            team_sched[a]['past_def'].append({'score': a_def_fav, 'display': a_disp})
         else:
-            team_sched[h]['fut_att'].append(h_att_obj)
-            team_sched[h]['fut_def'].append(h_def_obj)
-            team_sched[a]['fut_att'].append(a_att_obj)
-            team_sched[a]['fut_def'].append(a_def_obj)
+            team_sched[h]['fut_att'].append({'score': h_att_fav, 'display': h_disp})
+            team_sched[h]['fut_def'].append({'score': h_def_fav, 'display': h_disp})
+            team_sched[a]['fut_att'].append({'score': a_att_fav, 'display': a_disp})
+            team_sched[a]['fut_def'].append({'score': a_def_fav, 'display': a_disp})
 
     return team_sched
 
 def get_aggregated_data(schedule_list, limit=None):
-    # Normalizes the multiplier back to a 0-10 scale for the UI/Logic
-    # Base Multiplier 1.0 -> equates to roughly 5.0 on 0-10 scale
+    # This converts the raw strength multiplier (e.g., 0.8 or 1.3)
+    # into a 0-10 visual score.
     if not schedule_list: return 5.0, "-"
-    
     subset = schedule_list[:limit] if limit else schedule_list
     avg_mult = sum(item['score'] for item in subset) / len(subset)
     
-    # Convert Multiplier (0.6 to 1.4) to Score (2.0 to 8.0)
-    # Formula: (Multiplier - 0.5) * 10
-    # 1.0 -> 5.0
-    # 1.3 -> 8.0 (Easy)
-    # 0.7 -> 2.0 (Hard)
+    # Mapping: 0.6 (Hard) -> 1.0, 1.0 (Avg) -> 5.0, 1.4 (Easy) -> 9.0
     score = max(1.0, min(10.0, (avg_mult - 0.5) * 10))
-    
     display_str = ", ".join([item['display'] for item in subset])
-    return score, display_str
+    return score, avg_mult, display_str
 
 def min_max_scale(series):
     if series.empty: return series
@@ -143,18 +118,15 @@ def min_max_scale(series):
 # --- MAIN APP ---
 def main():
     st.title("🧠 FPL Pro Predictor: ROI Engine")
-    st.markdown("### Context-Aware Model (Stats + Home/Away Splits)")
+    st.markdown("### Context-Aware Model (Dynamic Fixture Scaling)")
 
     data, fixtures = load_data()
     if not data or not fixtures: return
 
     teams = data['teams']
     team_names = {t['id']: t['name'] for t in teams}
-    
-    # Run Advanced Fixture Engine
     team_schedule = process_fixtures_with_context(fixtures, teams)
     
-    # Team Defense Strength (for static CS calc)
     team_conceded = {t['id']: t['strength_defence_home'] + t['strength_defence_away'] for t in teams}
     max_str = max(team_conceded.values()) if team_conceded else 1
     team_def_strength = {k: 10 - ((v/max_str)*10) + 5 for k,v in team_conceded.items()}
@@ -209,7 +181,6 @@ def main():
     def run_analysis(player_type_ids, pos_category, weights):
         candidates = []
         
-        # FPL Point definitions
         if pos_category in ["GK", "DEF"]:
             pts_goal, pts_cs, pts_assist = 6, 4, 3
         elif pos_category == "MID":
@@ -222,18 +193,17 @@ def main():
             if p['minutes'] < min_minutes: continue
             tid = p['team']
             
-            # --- SMART FIXTURE SELECTION ---
-            # If player is GK/DEF, we care about DEFENSIVE schedule (Opponent Attack Strength)
-            # If player is MID/FWD, we care about ATTACKING schedule (Opponent Def Weakness)
+            # FIXTURE SELECTION
             if pos_category in ["GK", "DEF"]:
                 past_sched = team_schedule[tid]['past_def']
                 fut_sched = team_schedule[tid]['fut_def']
             else:
                 past_sched = team_schedule[tid]['past_att']
                 fut_sched = team_schedule[tid]['fut_att']
-                
-            past_score, _ = get_aggregated_data(past_sched)
-            future_score, future_display = get_aggregated_data(fut_sched, limit=horizon_option)
+            
+            # We retrieve 'future_mult' here (The raw multiplier, e.g., 0.8 or 1.3)
+            past_score, _, _ = get_aggregated_data(past_sched)
+            future_score, future_mult, future_display = get_aggregated_data(fut_sched, limit=horizon_option)
 
             try:
                 ppm = float(p['points_per_game'])
@@ -247,23 +217,31 @@ def main():
                 CS_rate = float(p.get('clean_sheets_per_90', 0))
                 saves = float(p.get('saves_per_90', 0))
                 
-                # Bonus Calculation
                 total_bonus = float(p.get('bonus', 0))
                 bonus_per_90 = (total_bonus / minutes) * 90
                 bonus_score = min(10, bonus_per_90 * 8)
                 internal_bps_weight = 0.4
 
-                # --- ROI SCORES ---
+                # --- DYNAMIC SCORING (FIX FOR POPE PROBLEM) ---
+                # Instead of just adding future_score, we MULTIPLY the stats by the future_mult.
                 
-                attack_potential = ((xG * pts_goal) + (xA * pts_assist)) * 1.5
-                attack_score = min(10, attack_potential)
+                # 1. Attack Potential (Scaled by Fixture Multiplier)
+                # Hard fixture (0.8) -> Attack Score drops 20%
+                attack_raw = ((xG * pts_goal) + (xA * pts_assist)) * 1.5
+                attack_score = min(10, attack_raw * future_mult)
 
+                # 2. Defense Potential (Scaled by Fixture Multiplier)
+                # This is the specific fix. CS Potential is crushed by hard fixtures.
                 team_factor = team_def_strength[tid] / 10.0 
-                def_raw = (CS_rate * pts_cs) * team_factor
-                if pos_category == "GK": def_raw += (saves / 3)
-                def_score = min(10, def_raw * 2.0)
+                cs_raw = (CS_rate * pts_cs) * team_factor * future_mult # <--- MULTIPLIED HERE
+                
+                # Save points are usually inverse to fixture ease (Harder game = More saves)
+                # So we do NOT multiply saves by future_mult (or we could inverse it)
+                save_points = (saves / 3) if pos_category == "GK" else 0
+                
+                def_score = min(10, (cs_raw + save_points) * 2.0)
 
-                # Calculation
+                # --- ROI CALCULATION ---
                 if pos_category == "GK":
                     base_score = (def_score * weights['cs']) + \
                                  (ppm * weights['ppm']) + \
@@ -285,7 +263,7 @@ def main():
                                  (def_component * 0.1) + \
                                  (bonus_score * internal_bps_weight)
 
-                # Resistance (Using Context-Aware Past Score)
+                # Resistance Factor
                 resistance_factor = max(2.0, min(past_score, 5.0))
                 raw_perf_metric = base_score / resistance_factor
                 
@@ -336,8 +314,8 @@ def main():
                 "Key Stat": st.column_config.NumberColumn(stat_label, format="%.2f"),
                 "Upcoming Fixtures": st.column_config.TextColumn("Opponents", width="medium"),
                 "PPM": st.column_config.NumberColumn("Pts/G", format="%.1f"),
-                "Future Fix": st.column_config.NumberColumn("Fut Fix", help="Higher = Easier (Adjusted for H/A & Team Strength)"),
-                "Past Fix": st.column_config.NumberColumn("Past Fix", help="Higher = Easier (Adjusted for H/A & Team Strength)"),
+                "Future Fix": st.column_config.NumberColumn("Fut Fix", help="Higher = Easier"),
+                "Past Fix": st.column_config.NumberColumn("Past Fix", help="Higher = Easier"),
             }
         )
         c1, _, c3 = st.columns([1, 2, 1])
