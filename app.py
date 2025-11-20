@@ -86,7 +86,7 @@ def min_max_scale(series):
 # --- MAIN APP ---
 def main():
     st.title("🧠 FPL Pro Predictor: ROI Engine")
-    st.markdown("### Value Identification System (FPL Point Rules Applied)")
+    st.markdown("### Context-Aware Model (Stats adjusted for Schedule)")
 
     data, fixtures = load_data()
     if not data or not fixtures: return
@@ -116,14 +116,14 @@ def main():
 
     # 1. GOALKEEPERS
     with st.sidebar.expander("🧤 Goalkeepers", expanded=False):
-        w_cs_gk = st.slider("Clean Sheet Potential", 0.1, 1.0, 0.5, key="gk_cs", on_change=reset_page)
+        w_cs_gk = st.slider("Clean Sheet / xGC", 0.1, 1.0, 0.5, key="gk_cs", on_change=reset_page)
         w_ppm_gk = st.slider("Form (PPM)", 0.1, 1.0, 0.5, key="gk_ppm", on_change=reset_page)
         w_fix_gk = st.slider("Fixture Favourability", 0.1, 1.0, 0.5, key="gk_fix", on_change=reset_page)
         gk_weights = {'cs': w_cs_gk, 'ppm': w_ppm_gk, 'fix': w_fix_gk}
 
     # 2. DEFENDERS
     with st.sidebar.expander("🛡️ Defenders", expanded=False):
-        w_cs_def = st.slider("Clean Sheet Potential", 0.1, 1.0, 0.5, key="def_cs", on_change=reset_page)
+        w_cs_def = st.slider("Clean Sheet / xGC", 0.1, 1.0, 0.5, key="def_cs", on_change=reset_page)
         w_xgi_def = st.slider("Attacking Threat (xGI)", 0.1, 1.0, 0.5, key="def_xgi", on_change=reset_page)
         w_ppm_def = st.slider("Form (PPM)", 0.1, 1.0, 0.5, key="def_ppm", on_change=reset_page)
         w_fix_def = st.slider("Fixture Favourability", 0.1, 1.0, 0.5, key="def_fix", on_change=reset_page)
@@ -150,7 +150,7 @@ def main():
     def run_analysis(player_type_ids, pos_category, weights):
         candidates = []
         
-        # 1. Assign Points per Action (PPA)
+        # Define FPL Point Values
         if pos_category in ["GK", "DEF"]:
             pts_goal, pts_cs, pts_assist = 6, 4, 3
         elif pos_category == "MID":
@@ -163,6 +163,7 @@ def main():
             if p['minutes'] < min_minutes: continue
             tid = p['team']
             
+            # CONTEXT: Fixture Difficulty
             past_score, _ = get_aggregated_data(team_schedule[tid]['past'])
             future_score, future_display = get_aggregated_data(team_schedule[tid]['future'], limit=horizon_option)
 
@@ -171,39 +172,38 @@ def main():
                 price = p['now_cost'] / 10.0
                 price = 4.0 if price <= 0 else price
                 
-                # Stats
+                # Stats (xGI, xGC, etc.)
                 xG = float(p.get('expected_goals_per_90', 0))
                 xA = float(p.get('expected_assists_per_90', 0))
                 xGI = float(p.get('expected_goal_involvements_per_90', 0))
+                xGC = float(p.get('expected_goals_conceded_per_90', 0)) # Added xGC
                 CS_rate = float(p.get('clean_sheets_per_90', 0))
-                saves = float(p.get('saves_per_90', 0))
-
-                # --- COMPONENT CALCULATION (Based on PPA) ---
                 
-                # A. Attack Potential (Scaled 0-10)
-                # Raw expected attack points per game
+                # --- COMPONENT SCORES (0-10 Scale) ---
+                
+                # 1. ATTACK SCORE (xG/xA/xGI)
                 raw_att_points = (xG * pts_goal) + (xA * pts_assist)
-                # Normalize: Elite attackers get ~1.0 raw points from xG/xA alone. Scale up.
                 attack_score = min(10, raw_att_points * 8.0)
 
-                # B. Defense Potential (Scaled 0-10)
-                team_factor = team_def_strength[tid] / 10.0 
-                raw_def_points = (CS_rate * pts_cs) * team_factor
-                def_score = min(10, raw_def_points * 3.0)
+                # 2. DEFENSE SCORE (CS_rate + xGC)
+                # FPL Logic: Low xGC is better.
+                # We create an "Inverse xGC Score": 
+                # 2.5 xGC/90 is terrible (0 score). 0.5 xGC/90 is elite.
+                inv_xgc_score = max(0, (2.5 - xGC) * 2.0) # Scale 0-5 approx
                 
-                # C. Save Potential (Internal Logic for GKs)
-                # 1 point for every 3 saves.
-                raw_save_points = saves / 3
-                save_score = min(10, raw_save_points * 6.0) # Scale to match other scores
-                internal_save_weight = 0.2 # Moderate weight
+                team_factor = team_def_strength[tid] / 10.0 
+                
+                # Blend Clean Sheet history with Underlying xGC
+                def_raw = ((CS_rate * pts_cs) * 1.5) + inv_xgc_score
+                def_score = min(10, def_raw * team_factor)
 
                 # --- ROI SCORE CONSTRUCTION ---
                 
                 if pos_category == "GK":
+                    # GK relies on Def Score (CS + xGC) + Form
                     base_score = (def_score * weights['cs']) + \
                                  (ppm * weights['ppm']) + \
-                                 (future_score * weights['fix']) + \
-                                 (save_score * internal_save_weight)
+                                 (future_score * weights['fix'])
                                  
                 elif pos_category == "DEF":
                     base_score = (def_score * weights['cs']) + \
@@ -212,18 +212,34 @@ def main():
                                  (future_score * weights['fix'])
                                  
                 else: # MID/FWD
+                    # Midfielders get slight penalty for High xGC (leakiness)
+                    # Forwards purely attack
                     def_component = def_score if pos_category == "MID" else 0
                     base_score = (attack_score * weights['xgi']) + \
                                  (ppm * weights['ppm']) + \
                                  (future_score * weights['fix']) + \
                                  (def_component * 0.1)
 
-                # --- RESISTANCE FACTOR (Context Aware) ---
-                # We divide the base score by the 'Past Ease'.
-                # If Past Score was High (Easy games), we divide by a big number -> Score drops.
-                # If Past Score was Low (Hard games), we divide by a small number -> Score rises.
-                resistance_factor = max(2.0, min(past_score, 5.0))
-                raw_perf_metric = base_score / resistance_factor
+                # --- THE CONTEXT RATIO (Context Aware Logic) ---
+                # Formula: (Future Ease / Past Ease)
+                # This effectively adjusts the 'Base Score' (which contains xGI/xGC).
+                
+                # Past Resistance (Low = Hard, High = Easy)
+                past_resistance = max(2.0, min(past_score, 5.0))
+                
+                # Future Opportunity (Low = Hard, High = Easy)
+                future_opportunity = max(2.0, min(future_score, 5.0))
+                
+                # Ratio Calculation
+                # 1. Stat-Padding Check: High Past / Low Future = Penalty (<1.0)
+                # 2. Fixture Swing Check: Low Past / High Future = Boost (>1.0)
+                context_multiplier = future_opportunity / past_resistance
+                
+                # Dampen the effect slightly so it's not too volatile
+                weighted_multiplier = context_multiplier ** 1.2
+                
+                # Final ROI Calculation
+                raw_perf_metric = base_score * weighted_multiplier
                 
                 status_icon = "✅" if p['status'] == 'a' else ("⚠️" if p['status'] == 'd' else "❌")
                 stat_disp = CS_rate if pos_category in ["GK", "DEF"] else xGI
