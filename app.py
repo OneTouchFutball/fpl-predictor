@@ -6,7 +6,7 @@ import numpy as np
 # --- CONFIGURATION ---
 st.set_page_config(page_title="FPL Pro Predictor 25/26", page_icon="⚽", layout="wide")
 
-# --- CUSTOM CSS (THE "GOOD" STYLING) ---
+# --- CUSTOM CSS ---
 st.markdown("""
 <style>
     /* Increase Tab Size and Font */
@@ -78,7 +78,9 @@ def process_fixtures(fixtures, teams_data):
         h_diff = f['team_h_difficulty']
         a_diff = f['team_a_difficulty']
 
-        # Favourability: 6 - Difficulty + 0.5 for Home
+        # Favourability Score: 6 - Difficulty + Home Advantage
+        # High Score = Easier Game.
+        # Home Advantage: +0.5 boost to Favourability (Easier to play at home)
         h_fav = (6 - h_diff) + 0.5
         a_fav = (6 - a_diff)
 
@@ -116,7 +118,7 @@ def min_max_scale(series):
 # --- MAIN APP ---
 def main():
     st.title("🧠 FPL Pro Predictor: ROI Engine")
-    st.markdown("### Weighted Model with Point Projections")
+    st.markdown("### Context-Aware Points Projection (Past Resistance × Future Opportunity)")
 
     data, fixtures = load_data()
     if not data or not fixtures:
@@ -156,11 +158,14 @@ def main():
     st.sidebar.subheader("Metric Weights")
     with st.sidebar.expander("GK & Defender Settings", expanded=False):
         w_cs = st.slider("Clean Sheet Potential", 0.1, 1.0, 0.5, on_change=reset_page, key="def_cs")
+        w_xgi_def = st.slider("Attacking Threat (xGI)", 0.1, 1.0, 0.5, on_change=reset_page, key="def_xgi")
+        w_work_def = st.slider("Defensive Workrate (CBIT)", 0.1, 1.0, 0.5, help="Clearances, Blocks, Interceptions, Tackles", on_change=reset_page, key="def_work")
         w_ppm_def = st.slider("Points Per Match (DEF)", 0.1, 1.0, 0.5, on_change=reset_page, key="def_ppm")
         w_fix_def = st.slider("Fixture Favourability (DEF)", 0.1, 1.0, 0.5, on_change=reset_page, key="def_fix")
 
     with st.sidebar.expander("Mid & Attacker Settings", expanded=False):
         w_xgi = st.slider("Total xGI Threat", 0.1, 1.0, 0.5, on_change=reset_page, key="att_xgi")
+        w_work_att = st.slider("Defensive Workrate (Recov)", 0.1, 1.0, 0.5, help="Recoveries & Pressing Actions", on_change=reset_page, key="att_work")
         w_ppm_att = st.slider("Points Per Match (ATT)", 0.1, 1.0, 0.5, on_change=reset_page, key="att_ppm")
         w_fix_att = st.slider("Fixture Favourability (ATT)", 0.1, 1.0, 0.5, on_change=reset_page, key="att_fix")
 
@@ -182,7 +187,7 @@ def main():
 
             tid = p['team']
             
-            # 1. Fixture Metrics
+            # 1. Fixture Metrics (Scores include Home/Away weighting)
             past_score, _ = get_aggregated_data(team_schedule[tid]['past'])
             future_score, future_display = get_aggregated_data(team_schedule[tid]['future'], limit=horizon_option)
 
@@ -192,32 +197,66 @@ def main():
                 price = p['now_cost'] / 10.0
                 if price <= 0: price = 4.0
                 
+                influence_val = float(p.get('influence', 0))
+                minutes = float(p['minutes']) if p['minutes'] > 0 else 1
+                workrate_per_90 = (influence_val / minutes) * 90
+                
+                # --- LOGIC BLOCK ---
                 if is_defense:
-                    # GK/DEF Logic
                     stat_val = float(p['clean_sheets_per_90'])
+                    xgi_val = float(p.get('expected_goal_involvements_per_90', 0))
                     stat_label = stat_val 
                     
+                    # A. ROI SCORE (0-10 Index)
                     cs_potential = (stat_val * 10) + (team_def_strength[tid] / 2)
-                    base_score = (cs_potential * w_cs) + (ppm * w_ppm_def) + (future_score * w_fix_def)
+                    workrate_score = min(10, workrate_per_90 / 3) 
+
+                    base_score = (cs_potential * w_cs) + \
+                                 ((xgi_val * 10) * w_xgi_def) + \
+                                 (workrate_score * w_work_def) + \
+                                 (ppm * w_ppm_def) + \
+                                 (future_score * w_fix_def)
                     
-                    # Proj Pts Logic (Defenders rely on CS potential + PPM)
-                    base_strength = (ppm * 0.7) + (stat_val * 6 * 0.3)
+                    # B. BASE ABILITY (Intrinsic Points Potential)
+                    # Combining Form, Clean Sheets, xGI, and Bonus Potential (Workrate)
+                    base_strength = (ppm * 0.4) + \
+                                    (stat_val * 6 * 0.3) + \
+                                    (xgi_val * 5 * 0.15) + \
+                                    (workrate_per_90 / 15 * 0.15)
 
                 else:
-                    # MID/FWD Logic
-                    stat_val = float(p.get('expected_goal_involvements_per_90', 0))
+                    stat_val = float(p.get('expected_goal_involvements_per_90', 0)) # xGI
                     stat_label = stat_val
                     
-                    base_score = ((stat_val * 10) * w_xgi) + (ppm * w_ppm_att) + (future_score * w_fix_att)
+                    # A. ROI SCORE
+                    workrate_score = min(10, workrate_per_90 / 3)
+                    base_score = ((stat_val * 10) * w_xgi) + \
+                                 (workrate_score * w_work_att) + \
+                                 (ppm * w_ppm_att) + \
+                                 (future_score * w_fix_att)
                     
-                    # Proj Pts Logic (Attackers rely on PPM + xGI upside)
-                    base_strength = (ppm * 0.7) + (stat_val * 8 * 0.3)
+                    # B. BASE ABILITY
+                    base_strength = (ppm * 0.45) + \
+                                    (stat_val * 6 * 0.4) + \
+                                    (workrate_per_90 / 20 * 0.15)
 
-                # 3. PREDICTED POINTS CALCULATION
-                fix_multiplier = future_score / 3.5
-                proj_points = base_strength * fix_multiplier
+                # 3. PREDICTED POINTS (The "Exp. Pts" Algorithm)
+                # New Logic: Base Ability × Past Context × Future Opportunity
+                
+                # Step 3a: Past Context (Resistance)
+                # If Past Score > 3.5 (Easy Games), we Discount ability.
+                # If Past Score < 3.5 (Hard Games), we Boost ability (Fixture Proof).
+                # We dampen the ratio (power of 0.7) to prevent extreme swings.
+                past_context_ratio = (3.5 / max(1.5, past_score)) ** 0.7
+                
+                # Step 3b: Future Context (Opportunity)
+                # Standard multiplier based on fixture ease
+                future_context_ratio = future_score / 3.5
+                
+                # Final Projection
+                proj_points = base_strength * past_context_ratio * future_context_ratio
 
-                # 4. Resistance Adjustment (For ROI Index)
+                # 4. ROI Resistance (Divisor for the Index)
                 resistance_factor = max(2.0, min(past_score, 5.0))
                 raw_perf_metric = base_score / resistance_factor
                 
@@ -228,6 +267,7 @@ def main():
                     "Team": team_names[tid],
                     "Price": price,
                     "Stat_Display": stat_label,
+                    "Workrate": workrate_per_90,
                     "Upcoming Fixtures": future_display,
                     "PPM": ppm,
                     "Exp. Pts": proj_points,
@@ -255,7 +295,7 @@ def main():
         
         df = df.sort_values(by="ROI Index", ascending=False)
         
-        cols = ["ROI Index", "Name", "Team", "Exp. Pts", "Price", "Stat_Display", "Upcoming Fixtures", "PPM", "Future Fix", "Past Fix"]
+        cols = ["ROI Index", "Name", "Team", "Exp. Pts", "Price", "Stat_Display", "Workrate", "Upcoming Fixtures", "PPM", "Future Fix", "Past Fix"]
         return df[cols]
 
     # --- DISPLAY ---
@@ -290,13 +330,18 @@ def main():
             hide_index=True, 
             column_config={
                 "ROI Index": st.column_config.ProgressColumn("ROI Index", format="%.1f", min_value=0, max_value=10),
-                "Exp. Pts": st.column_config.NumberColumn("Exp. Pts", format="%.1f", help="Projected points per match based on form & upcoming fixtures."),
+                "Exp. Pts": st.column_config.NumberColumn(
+                    "Exp. Pts", 
+                    format="%.1f", 
+                    help="Predicted Points: Base Ability × Past Resistance Adjustment × Future Fixture Difficulty"
+                ),
                 "Price": st.column_config.NumberColumn("£", format="£%.1f"),
                 "Stat_Display": st.column_config.NumberColumn(stat_col_name, format="%.2f", help=f"{stat_col_name} stats from FPL API"),
+                "Workrate": st.column_config.NumberColumn("Workrate", format="%.1f", help="Defensive Activity (CBIT/Recoveries) per 90 mins."),
                 "Upcoming Fixtures": st.column_config.TextColumn("Opponents", width="medium"),
                 "PPM": st.column_config.NumberColumn("Pts/G", format="%.1f"),
-                "Future Fix": st.column_config.NumberColumn("Fut Fix", help="Higher = Easier Upcoming Fixtures"),
-                "Past Fix": st.column_config.NumberColumn("Past Fix", help="Higher = Easier Past Fixtures"),
+                "Future Fix": st.column_config.NumberColumn("Fut Fix", help="Higher = Easier Upcoming Fixtures (Includes Home/Away)"),
+                "Past Fix": st.column_config.NumberColumn("Past Fix", help="Higher = Easier Past Fixtures (Includes Home/Away)"),
             },
             use_container_width=True
         )
@@ -312,7 +357,6 @@ def main():
                 st.rerun()
 
     # --- RENDER TABS ---
-    # Using the Uppercase Names to match the bold CSS style
     tab_gk, tab_def, tab_mid, tab_fwd = st.tabs([
         "🧤 GOALKEEPERS", 
         "🛡️ DEFENDERS", 
