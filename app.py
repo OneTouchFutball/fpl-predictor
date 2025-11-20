@@ -46,7 +46,7 @@ def load_data():
         return bootstrap, None
     return bootstrap, fixtures
 
-# --- FIXTURE ENGINE ---
+# --- FIXTURE ENGINE (PAST & FUTURE) ---
 def process_fixtures(fixtures, teams_data):
     team_map = {t['id']: t['short_name'] for t in teams_data}
     
@@ -60,41 +60,58 @@ def process_fixtures(fixtures, teams_data):
             'def_a': t['strength_defence_away']
         }
         
-    team_sched = {t['id']: {'opp_att': [], 'opp_def': [], 'display': []} for t in teams_data}
+    # Containers for Past (Context) and Future (Opportunity)
+    team_sched = {t['id']: {'past_opp_att': [], 'past_opp_def': [], 'fut_opp_att': [], 'fut_opp_def': [], 'fut_disp': []} for t in teams_data}
 
     for f in fixtures:
-        if not f['kickoff_time'] or f['finished']: continue
+        if not f['kickoff_time']: continue
         h, a = f['team_h'], f['team_a']
         
-        # Store specific strength of the opponent they are facing
-        # Home Team faces Away Att/Def
-        team_sched[h]['opp_att'].append(t_stats[a]['att_a'])
-        team_sched[h]['opp_def'].append(t_stats[a]['def_a'])
-        team_sched[h]['display'].append(f"{team_map[a]}(H)")
+        # Determine Opponent Strengths
+        # Home Team faces Away Stats
+        h_opp_att = t_stats[a]['att_a']
+        h_opp_def = t_stats[a]['def_a']
         
-        # Away Team faces Home Att/Def
-        team_sched[a]['opp_att'].append(t_stats[h]['att_h'])
-        team_sched[a]['opp_def'].append(t_stats[h]['def_h'])
-        team_sched[a]['display'].append(f"{team_map[h]}(A)")
+        # Away Team faces Home Stats
+        a_opp_att = t_stats[h]['att_h']
+        a_opp_def = t_stats[h]['def_h']
+
+        if f['finished']:
+            # PAST: We store what they faced to calculate "Resistance"
+            team_sched[h]['past_opp_att'].append(h_opp_att)
+            team_sched[h]['past_opp_def'].append(h_opp_def)
+            
+            team_sched[a]['past_opp_att'].append(a_opp_att)
+            team_sched[a]['past_opp_def'].append(a_opp_def)
+        else:
+            # FUTURE: We store what they will face
+            team_sched[h]['fut_opp_att'].append(h_opp_att)
+            team_sched[h]['fut_opp_def'].append(h_opp_def)
+            team_sched[h]['fut_disp'].append(f"{team_map[a]}(H)")
+            
+            team_sched[a]['fut_opp_att'].append(a_opp_att)
+            team_sched[a]['fut_opp_def'].append(a_opp_def)
+            team_sched[a]['fut_disp'].append(f"{team_map[h]}(A)")
 
     return team_sched
 
-def get_fixture_score(schedule_list, limit=None, opponent_type="def"):
-    # Returns a 0-10 score where 10 is easiest, 0 is hardest
+def get_fixture_score(schedule_list, limit=None):
+    # 0-10 Scale for Future Difficulty (High = Easy)
     if not schedule_list: return 5.0, "-"
-    
     subset = schedule_list[:limit] if limit else schedule_list
-    
-    # Average Strength of Opponent
     avg_strength = sum(subset) / len(subset)
-    
-    # Normalize (League Avg ~1100. Max ~1350. Min ~1000)
-    # We want Low Strength to be High Score (Easy)
-    # Formula: 1350 (Hard) -> 0, 1000 (Easy) -> 10
+    # Normalize: 1350(Hard) -> 0, 1000(Easy) -> 10
     score = 10 - ((avg_strength - 1000) / 350 * 10)
-    score = max(0, min(10, score)) # Clamp
-    
-    return score
+    return max(0, min(10, score))
+
+def get_resistance_factor(past_strengths):
+    # Returns a multiplier (e.g. 0.9 or 1.1) based on past difficulty
+    if not past_strengths: return 1.0
+    avg_strength = sum(past_strengths) / len(past_strengths)
+    # League Avg ~ 1100.
+    # If Avg Opp Strength was 1000 (Easy), Factor = 1000/1100 = 0.90 (Discount points)
+    # If Avg Opp Strength was 1300 (Hard), Factor = 1300/1100 = 1.18 (Boost points)
+    return avg_strength / 1100.0
 
 def min_max_scale(series):
     if series.empty: return series
@@ -104,8 +121,8 @@ def min_max_scale(series):
 
 # --- MAIN APP ---
 def main():
-    st.title("🧠 FPL Pro Predictor: ROI Engine")
-    st.markdown("### User-Controlled Weighted Model")
+    st.title("🧠 FPL Pro Predictor: Contextual ROI Engine")
+    st.markdown("### Context-Adjusted Model (Past Resistance × Future Opportunity)")
 
     data, fixtures = load_data()
     if not data or not fixtures: return
@@ -114,8 +131,7 @@ def main():
     team_names = {t['id']: t['name'] for t in teams}
     team_schedule = process_fixtures(fixtures, teams)
     
-    # Calculate dynamic maxes for normalization
-    # We need to know what "Good" looks like to scale to 0-10
+    # Normalization Maxima
     all_elements = pd.DataFrame(data['elements'])
     MAX_PPM = all_elements['points_per_game'].astype(float).max()
     MAX_CS = all_elements['clean_sheets_per_90'].astype(float).max()
@@ -131,10 +147,9 @@ def main():
     st.sidebar.divider()
     st.sidebar.header("⚖️ Impact Weights")
     
-    # DIRECT PRICE CONTROL
     w_budget = st.sidebar.slider(
         "Price Impact", 0.0, 1.0, 0.5, 
-        help="0.0 = Ignore Price (Best Players). 1.0 = Full Price Sensitivity (Best Value).",
+        help="0.0 = Ignore Price. 1.0 = Full Price Sensitivity.",
         key="price_weight", on_change=reset_page
     )
     
@@ -182,56 +197,64 @@ def main():
             if p['minutes'] < min_minutes: continue
             tid = p['team']
             
-            # FIXTURE SCORES (0-10 Scale)
-            # GK/DEF care about Opponent Attack Strength
-            # MID/FWD care about Opponent Defense Strength
+            # --- CONTEXT ENGINE ---
+            # 1. FUTURE: Opportunity (Opponent Weakness)
+            # GK/DEF want Weak Opponent Attack.
+            # MID/FWD want Weak Opponent Defense.
             if pos_category in ["GK", "DEF"]:
-                opp_sched = team_schedule[tid]['opp_att']
+                fut_sched = team_schedule[tid]['fut_opp_att']
+                past_sched = team_schedule[tid]['past_opp_att']
+                fixture_score = get_fixture_score(fut_sched, limit=horizon_option)
             else:
-                opp_sched = team_schedule[tid]['opp_def']
+                fut_sched = team_schedule[tid]['fut_opp_def']
+                past_sched = team_schedule[tid]['past_opp_def']
+                fixture_score = get_fixture_score(fut_sched, limit=horizon_option)
             
-            # Retrieve normalized fixture score (10=Easy, 0=Hard)
-            fixture_score = get_fixture_score(opp_sched, limit=horizon_option)
-            display_fixtures = ", ".join(team_schedule[tid]['display'][:horizon_option])
+            # 2. PAST: Resistance (Opponent Strength)
+            # Calculate multiplier: Did they play tough teams?
+            resistance_mult = get_resistance_factor(past_sched)
+
+            display_fixtures = ", ".join(team_schedule[tid]['fut_disp'][:horizon_option])
 
             try:
-                # RAW STATS
                 price = p['now_cost'] / 10.0
-                if price <= 0: price = 4.0
+                price = 4.0 if price <= 0 else price
                 
                 raw_ppm = float(p['points_per_game'])
                 raw_cs = float(p['clean_sheets_per_90'])
                 raw_xgi = float(p.get('expected_goal_involvements_per_90', 0))
 
-                # NORMALIZE TO 0-10 (Relative to League Best)
-                # This ensures that a weight of "1.0" on PPM means the same as "1.0" on xGI
-                score_ppm = (raw_ppm / MAX_PPM) * 10
-                score_cs = (raw_cs / MAX_CS) * 10 if MAX_CS > 0 else 0
-                score_xgi = (raw_xgi / MAX_XGI) * 10 if MAX_XGI > 0 else 0
-                score_fix = fixture_score # Already 0-10
+                # --- APPLY CONTEXT ---
+                # Adjust the stats based on Past Resistance
+                # If Resistance > 1.0 (Hard Past), Stats get Boosted (True ability is higher)
+                # If Resistance < 1.0 (Easy Past), Stats get Discounted (Flat-track bully)
+                adj_ppm = raw_ppm * resistance_mult
+                adj_cs = raw_cs * resistance_mult
+                adj_xgi = raw_xgi * resistance_mult
 
-                # DIRECT WEIGHTED SUM
+                # NORMALIZE (Using Adjusted Stats vs Global Max)
+                score_ppm = (adj_ppm / MAX_PPM) * 10
+                score_cs = (adj_cs / MAX_CS) * 10 if MAX_CS > 0 else 0
+                score_xgi = (adj_xgi / MAX_XGI) * 10 if MAX_XGI > 0 else 0
+                score_fix = fixture_score
+
+                # WEIGHTED SUM
                 total_score = 0
-                
                 if pos_category == "GK":
                     total_score = (score_cs * weights['cs']) + \
                                   (score_ppm * weights['ppm']) + \
                                   (score_fix * weights['fix'])
-                                  
                 elif pos_category == "DEF":
                     total_score = (score_cs * weights['cs']) + \
                                   (score_xgi * weights['xgi']) + \
                                   (score_ppm * weights['ppm']) + \
                                   (score_fix * weights['fix'])
-                                  
                 else: # MID/FWD
                     total_score = (score_xgi * weights['xgi']) + \
                                   (score_ppm * weights['ppm']) + \
                                   (score_fix * weights['fix'])
                 
-                # PRICE ADJUSTMENT (Power Law)
-                # If w_budget is 0, divisor is 1.0 (Score unchanged)
-                # If w_budget is 1, divisor is Price (Score / Price)
+                # PRICE ADJUSTMENT
                 price_divisor = price ** w_budget
                 roi_index = total_score / price_divisor
                 
@@ -244,19 +267,19 @@ def main():
                     "Key Stat": stat_disp,
                     "Upcoming Fixtures": display_fixtures,
                     "PPM": raw_ppm,
+                    "Past Diff": round(resistance_mult, 2), # Visual check for context
                     "Fix Score": round(fixture_score, 1),
-                    "Raw Score": roi_index # For sorting before display
+                    "Raw Score": roi_index
                 })
             except: continue
 
         df = pd.DataFrame(candidates)
         if df.empty: return df
         
-        # Final 0-10 Scaling for the UI Bar
         df['ROI Index'] = min_max_scale(df['Raw Score'])
-        
         df = df.sort_values(by="ROI Index", ascending=False)
-        return df[["ROI Index", "Name", "Team", "Price", "Key Stat", "Upcoming Fixtures", "PPM", "Fix Score"]]
+        
+        return df[["ROI Index", "Name", "Team", "Price", "Key Stat", "Upcoming Fixtures", "PPM", "Past Diff", "Fix Score"]]
 
     # --- RENDER ---
     def render_tab(p_ids, pos_cat, weights):
@@ -278,7 +301,8 @@ def main():
                 "Key Stat": st.column_config.NumberColumn(stat_label, format="%.2f"),
                 "Upcoming Fixtures": st.column_config.TextColumn("Opponents", width="medium"),
                 "PPM": st.column_config.NumberColumn("Pts/G", format="%.1f"),
-                "Fix Score": st.column_config.NumberColumn("Fix Rating", help="0-10 Scale. 10 = Easiest Games. 0 = Hardest Games."),
+                "Past Diff": st.column_config.NumberColumn("Past Diff", help=">1.0: Played Hard Teams (Stats Boosted). <1.0: Played Easy Teams (Stats Discounted)."),
+                "Fix Score": st.column_config.NumberColumn("Fix Score", help="10 = Easy Future. 0 = Hard Future."),
             }
         )
         c1, _, c3 = st.columns([1, 2, 1])
