@@ -86,7 +86,7 @@ def min_max_scale(series):
 # --- MAIN APP ---
 def main():
     st.title("🧠 FPL Pro Predictor: ROI Engine")
-    st.markdown("### Advanced Value Identification System")
+    st.markdown("### Value Identification System (FPL Point Rules Applied)")
 
     data, fixtures = load_data()
     if not data or not fixtures: return
@@ -150,7 +150,7 @@ def main():
     def run_analysis(player_type_ids, pos_category, weights):
         candidates = []
         
-        # Define FPL Point Values based on Position
+        # 1. Assign Points per Action (PPA)
         if pos_category in ["GK", "DEF"]:
             pts_goal, pts_cs, pts_assist = 6, 4, 3
         elif pos_category == "MID":
@@ -170,7 +170,6 @@ def main():
                 ppm = float(p['points_per_game'])
                 price = p['now_cost'] / 10.0
                 price = 4.0 if price <= 0 else price
-                minutes = float(p['minutes']) if p['minutes'] > 0 else 1
                 
                 # Stats
                 xG = float(p.get('expected_goals_per_90', 0))
@@ -178,25 +177,27 @@ def main():
                 xGI = float(p.get('expected_goal_involvements_per_90', 0))
                 CS_rate = float(p.get('clean_sheets_per_90', 0))
                 saves = float(p.get('saves_per_90', 0))
-                
-                # INTERNAL LOGIC: Saves (GK Only) - kept as requested previously
-                save_points_per_90 = saves / 3
-                save_score = min(10, save_points_per_90 * 6)
-                internal_save_weight = 0.5
 
-                # --- ROI COMPONENT SCORES (0-10 Scale) ---
+                # --- COMPONENT CALCULATION (Based on PPA) ---
                 
-                # Attack Potential
-                attack_potential = ((xG * pts_goal) + (xA * pts_assist)) * 1.5
-                attack_score = min(10, attack_potential)
+                # A. Attack Potential (Scaled 0-10)
+                # Raw expected attack points per game
+                raw_att_points = (xG * pts_goal) + (xA * pts_assist)
+                # Normalize: Elite attackers get ~1.0 raw points from xG/xA alone. Scale up.
+                attack_score = min(10, raw_att_points * 8.0)
 
-                # Defense Potential
+                # B. Defense Potential (Scaled 0-10)
                 team_factor = team_def_strength[tid] / 10.0 
-                def_raw = (CS_rate * pts_cs) * team_factor
-                if pos_category == "GK": def_raw += (saves / 3)
-                def_score = min(10, def_raw * 2.0)
+                raw_def_points = (CS_rate * pts_cs) * team_factor
+                def_score = min(10, raw_def_points * 3.0)
+                
+                # C. Save Potential (Internal Logic for GKs)
+                # 1 point for every 3 saves.
+                raw_save_points = saves / 3
+                save_score = min(10, raw_save_points * 6.0) # Scale to match other scores
+                internal_save_weight = 0.2 # Moderate weight
 
-                # --- ROI INDEX CALCULATION (Bonus Logic Removed) ---
+                # --- ROI SCORE CONSTRUCTION ---
                 
                 if pos_category == "GK":
                     base_score = (def_score * weights['cs']) + \
@@ -217,7 +218,10 @@ def main():
                                  (future_score * weights['fix']) + \
                                  (def_component * 0.1)
 
-                # --- RESISTANCE FACTOR ---
+                # --- RESISTANCE FACTOR (Context Aware) ---
+                # We divide the base score by the 'Past Ease'.
+                # If Past Score was High (Easy games), we divide by a big number -> Score drops.
+                # If Past Score was Low (Hard games), we divide by a small number -> Score rises.
                 resistance_factor = max(2.0, min(past_score, 5.0))
                 raw_perf_metric = base_score / resistance_factor
                 
