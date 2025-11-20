@@ -179,48 +179,45 @@ def main():
                 CS_rate = float(p.get('clean_sheets_per_90', 0))
                 saves = float(p.get('saves_per_90', 0))
                 
-                # INTERNAL BONUS LOGIC (Hidden Weight)
-                total_bonus = float(p.get('bonus', 0))
-                bonus_per_90 = (total_bonus / minutes) * 90
-                bonus_score = min(10, bonus_per_90 * 8)
-                internal_bps_weight = 0.4
+                # INTERNAL LOGIC: Saves (GK Only) - kept as requested previously
+                save_points_per_90 = saves / 3
+                save_score = min(10, save_points_per_90 * 6)
+                internal_save_weight = 0.5
 
                 # --- ROI COMPONENT SCORES (0-10 Scale) ---
                 
-                # Attack Potential (xG/xA adjusted for position points)
+                # Attack Potential
                 attack_potential = ((xG * pts_goal) + (xA * pts_assist)) * 1.5
                 attack_score = min(10, attack_potential)
 
-                # Defense Potential (CS + Saves)
+                # Defense Potential
                 team_factor = team_def_strength[tid] / 10.0 
                 def_raw = (CS_rate * pts_cs) * team_factor
                 if pos_category == "GK": def_raw += (saves / 3)
                 def_score = min(10, def_raw * 2.0)
 
-                # --- ROI INDEX CALCULATION ---
+                # --- ROI INDEX CALCULATION (Bonus Logic Removed) ---
+                
                 if pos_category == "GK":
                     base_score = (def_score * weights['cs']) + \
                                  (ppm * weights['ppm']) + \
                                  (future_score * weights['fix']) + \
-                                 (bonus_score * internal_bps_weight)
+                                 (save_score * internal_save_weight)
                                  
                 elif pos_category == "DEF":
                     base_score = (def_score * weights['cs']) + \
                                  (attack_score * weights['xgi']) + \
                                  (ppm * weights['ppm']) + \
-                                 (future_score * weights['fix']) + \
-                                 (bonus_score * internal_bps_weight)
+                                 (future_score * weights['fix'])
                                  
                 else: # MID/FWD
                     def_component = def_score if pos_category == "MID" else 0
                     base_score = (attack_score * weights['xgi']) + \
                                  (ppm * weights['ppm']) + \
                                  (future_score * weights['fix']) + \
-                                 (def_component * 0.1) + \
-                                 (bonus_score * internal_bps_weight)
+                                 (def_component * 0.1)
 
                 # --- RESISTANCE FACTOR ---
-                # Adjusts score based on past opponent difficulty
                 resistance_factor = max(2.0, min(past_score, 5.0))
                 raw_perf_metric = base_score / resistance_factor
                 
@@ -251,7 +248,6 @@ def main():
         
         df = df.sort_values(by="ROI Index", ascending=False)
         
-        # Return only clean columns
         return df[["ROI Index", "Name", "Team", "Price", "Key Stat", "Upcoming Fixtures", "PPM", "Future Fix", "Past Fix"]]
 
     # --- RENDER TABS ---
