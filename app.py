@@ -31,27 +31,48 @@ def load_training_data():
     if os.path.exists("fpl_5_year_history.csv"):
         return pd.read_csv("fpl_5_year_history.csv")
     
-    # Fallback Downloader
     seasons = ["2020-21", "2021-22", "2022-23", "2023-24", "2024-25", "2025-26"]
     base_url = "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data"
     all_data = []
+    
     for season in seasons:
         try:
             url = f"{base_url}/{season}/gws/merged_gw.csv"
             r = requests.get(url)
             if r.status_code == 200:
                 df = pd.read_csv(io.BytesIO(r.content), on_bad_lines='skip', low_memory=False)
-                # Fetching extensive list, filtering happens in training function
-                cols = ['minutes', 'total_points', 'was_home', 'clean_sheets', 
-                        'goals_conceded', 'expected_goals', 'expected_assists', 
-                        'expected_goals_conceded',
-                        'influence', 'creativity', 'threat', 'value', 'element_type',
-                        'goals_scored', 'assists', 'saves', 'bps', 'yellow_cards']
-                existing = [c for c in cols if c in df.columns]
-                all_data.append(df[existing])
+                
+                # --- FIX: ROBUST COLUMN SELECTION ---
+                # We need these columns. We grab whatever is available.
+                target_cols = [
+                    'minutes', 'total_points', 'was_home', 'clean_sheets', 
+                    'goals_conceded', 'expected_goals', 'expected_assists', 
+                    'expected_goals_conceded', 'influence', 'creativity', 'threat', 
+                    'value', 'element_type', 'position', # Grab 'position' as backup
+                    'goals_scored', 'assists', 'saves', 'bps', 'yellow_cards'
+                ]
+                
+                # Intersection of what we want vs what exists
+                existing = [c for c in target_cols if c in df.columns]
+                df = df[existing]
+                
+                all_data.append(df)
         except: pass
+        
     if all_data:
-        return pd.concat(all_data).fillna(0)
+        master_df = pd.concat(all_data).fillna(0)
+        
+        # --- CRITICAL FIX FOR KEY ERROR ---
+        # If 'element_type' is missing but 'position' exists (GK/DEF/MID/FWD), map it.
+        if 'element_type' not in master_df.columns and 'position' in master_df.columns:
+            pos_map = {'GK': 1, 'DEF': 2, 'MID': 3, 'FWD': 4, 'GKP': 1}
+            master_df['element_type'] = master_df['position'].map(pos_map).fillna(0)
+            
+        # Fallback: If neither exists, drop rows (bad data) or assume MID(3)
+        if 'element_type' not in master_df.columns:
+             master_df['element_type'] = 3 
+             
+        return master_df
     return None
 
 @st.cache_resource
@@ -62,45 +83,48 @@ def train_dual_models():
     # Filter Starters (>60 mins)
     df = df[df['minutes'] > 60].copy()
     
+    # Ensure numeric types for filtering
+    df['element_type'] = pd.to_numeric(df['element_type'], errors='coerce').fillna(0)
+    
     # --- SPLIT DATASETS ---
     df_def = df[df['element_type'].isin([1, 2])] # GK/DEF
     df_att = df[df['element_type'].isin([3, 4])] # MID/FWD
     
     # --- MODEL 1: DEFENSIVE SPECIALIST ---
-    # Uses xGC to predict defense. Uses xG/xA for Fullback potential.
-    # NO Result Stats (CS/Goals/Assists) to prevent leakage.
     feats_def = [
         'minutes', 'was_home', 'element_type',
-        'expected_goals_conceded', # <--- The primary defensive metric
-        'influence',               # Proxy for defensive actions (CBIT)
-        'expected_goals', 'expected_assists', 'threat', 'creativity', # Attacking threat
+        'expected_goals_conceded', 'influence', 
+        'expected_goals', 'expected_assists', 'threat', 'creativity', 
         'yellow_cards'
     ]
     valid_feats_def = [f for f in feats_def if f in df_def.columns]
     
-    model_def = RandomForestRegressor(n_estimators=50, max_depth=10, n_jobs=-1, random_state=42)
-    model_def.fit(df_def[valid_feats_def], df_def['total_points'])
-    
+    if len(df_def) > 100: # Only train if enough data
+        model_def = RandomForestRegressor(n_estimators=50, max_depth=10, n_jobs=-1, random_state=42)
+        model_def.fit(df_def[valid_feats_def], df_def['total_points'])
+        imp_def = pd.DataFrame({'Stat': valid_feats_def, 'Weight': model_def.feature_importances_}).sort_values(by='Weight', ascending=False)
+        imp_def['Weight'] = (imp_def['Weight'] / imp_def['Weight'].sum()) * 100
+    else:
+        model_def = None
+        imp_def = pd.DataFrame()
+
     # --- MODEL 2: ATTACKING SPECIALIST ---
-    # IGNORES xGC (Attackers don't care about team defense)
-    # Focuses purely on offensive underlying data
     feats_att = [
         'minutes', 'was_home', 'element_type',
         'expected_goals', 'expected_assists', 
-        'threat', 'creativity', 'influence',
+        'threat', 'creativity', 'influence', 
         'yellow_cards'
     ]
     valid_feats_att = [f for f in feats_att if f in df_att.columns]
     
-    model_att = RandomForestRegressor(n_estimators=50, max_depth=10, n_jobs=-1, random_state=42)
-    model_att.fit(df_att[valid_feats_att], df_att['total_points'])
-    
-    # --- EXTRACT IMPORTANCE ---
-    imp_def = pd.DataFrame({'Stat': valid_feats_def, 'Weight': model_def.feature_importances_}).sort_values(by='Weight', ascending=False)
-    imp_def['Weight'] = (imp_def['Weight'] / imp_def['Weight'].sum()) * 100
-    
-    imp_att = pd.DataFrame({'Stat': valid_feats_att, 'Weight': model_att.feature_importances_}).sort_values(by='Weight', ascending=False)
-    imp_att['Weight'] = (imp_att['Weight'] / imp_att['Weight'].sum()) * 100
+    if len(df_att) > 100:
+        model_att = RandomForestRegressor(n_estimators=50, max_depth=10, n_jobs=-1, random_state=42)
+        model_att.fit(df_att[valid_feats_att], df_att['total_points'])
+        imp_att = pd.DataFrame({'Stat': valid_feats_att, 'Weight': model_att.feature_importances_}).sort_values(by='Weight', ascending=False)
+        imp_att['Weight'] = (imp_att['Weight'] / imp_att['Weight'].sum()) * 100
+    else:
+        model_att = None
+        imp_att = pd.DataFrame()
     
     max_pts = df['total_points'].quantile(0.99)
     
@@ -166,7 +190,7 @@ def main():
     st.title("🧬 FPL Pro: Hybrid Intelligence")
     
     # 1. Load & Train
-    with st.spinner("Training Specialist AI Models (Defensive vs Attacking)..."):
+    with st.spinner("Training Specialist AI Models..."):
         model_def, feat_def, model_att, feat_att, max_ai_pts, (imp_def, imp_att) = train_dual_models()
     
     if model_def is None:
@@ -184,7 +208,7 @@ def main():
     df['matches_played'] = df['minutes'] / 90
     df = df[df['matches_played'] > 2.0]
     
-    # AI Input Prep
+    # AI Input Prep (Universal Mapping)
     ai_input = pd.DataFrame()
     ai_input['element_type'] = df['element_type']
     ai_input['was_home'] = 0.5
@@ -199,8 +223,8 @@ def main():
     }
     
     for train_col, api_col in stat_map.items():
-        # Check both lists to ensure we map everything needed for both models
-        if (train_col in feat_def) or (train_col in feat_att):
+        needed = (train_col in feat_def) or (train_col in feat_att)
+        if needed:
             if 'per_90' in api_col:
                 ai_input[train_col] = pd.to_numeric(df[api_col], errors='coerce').fillna(0)
             else:
@@ -214,9 +238,11 @@ def main():
     
     # --- UI ---
     st.sidebar.header("🧠 Dual-Brain Scan")
-    b1, b2 = st.sidebar.tabs(["Def", "Att"])
-    b1.dataframe(imp_def.head(7).style.format({"Weight": "{:.1f}%"}), hide_index=True)
-    b2.dataframe(imp_att.head(7).style.format({"Weight": "{:.1f}%"}), hide_index=True)
+    brain_tab1, brain_tab2 = st.sidebar.tabs(["Def", "Att"])
+    if not imp_def.empty:
+        brain_tab1.dataframe(imp_def.head(7).style.format({"Weight": "{:.1f}%"}), hide_index=True)
+    if not imp_att.empty:
+        brain_tab2.dataframe(imp_att.head(7).style.format({"Weight": "{:.1f}%"}), hide_index=True)
     
     st.sidebar.divider()
     st.sidebar.header("🔮 Horizon")
@@ -224,6 +250,7 @@ def main():
     
     st.sidebar.divider()
     st.sidebar.header("⚖️ Weights")
+    
     w_budget = st.sidebar.slider("Price Sensitivity", 0.0, 1.0, 0.5)
     
     with st.sidebar.expander("🧤 GK Settings", expanded=False):
