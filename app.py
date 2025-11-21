@@ -31,7 +31,6 @@ def load_training_data():
     if os.path.exists("fpl_5_year_history.csv"):
         df = pd.read_csv("fpl_5_year_history.csv")
     else:
-        # Fallback Downloader
         seasons = ["2020-21", "2021-22", "2022-23", "2023-24", "2024-25", "2025-26"]
         base_url = "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data"
         all_data = []
@@ -41,13 +40,11 @@ def load_training_data():
                 r = requests.get(url)
                 if r.status_code == 200:
                     temp_df = pd.read_csv(io.BytesIO(r.content), on_bad_lines='skip', low_memory=False)
-                    
                     cols = ['minutes', 'total_points', 'was_home', 'clean_sheets', 
                             'goals_conceded', 'expected_goals', 'expected_assists', 
                             'expected_goals_conceded', 'influence', 'creativity', 'threat', 
                             'value', 'element_type', 'position', 
                             'goals_scored', 'assists', 'saves', 'bps', 'yellow_cards']
-                    
                     existing = [c for c in cols if c in temp_df.columns]
                     temp_df = temp_df[existing]
                     all_data.append(temp_df)
@@ -65,7 +62,6 @@ def load_training_data():
             df['element_type'] = df['position'].map(pos_map).fillna(3).astype(int)
         else:
             df['element_type'] = 3
-            
     df['element_type'] = pd.to_numeric(df['element_type'], errors='coerce').fillna(3).astype(int)
     
     return df
@@ -78,16 +74,14 @@ def train_dual_models():
     if 'minutes' in df.columns:
         df = df[df['minutes'] > 60].copy()
     
-    # --- SPLIT DATASETS ---
-    df_def = df[df['element_type'].isin([1, 2])].copy() # GK/DEF
-    df_att = df[df['element_type'].isin([3, 4])].copy() # MID/FWD
+    df_def = df[df['element_type'].isin([1, 2])].copy() 
+    df_att = df[df['element_type'].isin([3, 4])].copy() 
     
-    # --- CLEAN XGC DATA ---
     if 'expected_goals_conceded' in df_def.columns:
         df_def = df_def[df_def['expected_goals_conceded'] > 0]
 
     # --- MODEL 1: DEFENSIVE SPECIALIST ---
-    # INCLUDED: Influence (captures BPS/Workrate/Attacking output for defenders)
+    # Includes Influence (for BPS/Actions)
     feats_def = [
         'minutes', 'was_home', 'element_type',
         'expected_goals_conceded', 
@@ -108,7 +102,7 @@ def train_dual_models():
         imp_def = pd.DataFrame()
 
     # --- MODEL 2: ATTACKING SPECIALIST ---
-    # EXCLUDED: Influence (Prevent leakage)
+    # No Influence
     feats_att = [
         'minutes', 'was_home', 'element_type',
         'expected_goals', 'expected_assists', 
@@ -216,7 +210,6 @@ def main():
     ai_input['element_type'] = df['element_type']
     ai_input['was_home'] = 0.5
     
-    # MAPPING
     stat_map = {
         'minutes': 'minutes',
         'expected_goals': 'expected_goals_per_90',
@@ -265,13 +258,19 @@ def main():
     w_budget = st.sidebar.slider("Price Sensitivity", 0.0, 1.0, 0.5)
     
     with st.sidebar.expander("🧤 GK Settings", expanded=False):
-        w_gk = {'ai': st.slider("AI (xGC/Stats)", 0.0, 1.0, 0.6, key="g1"), 'form': st.slider("Form (PPM)", 0.0, 1.0, 0.4, key="g2"), 'fix': st.slider("Fixture Impact", 0.0, 1.0, 1.0, key="g3")}
+        w_gk = {
+            'ai': st.slider("AI (xGC/Stats)", 0.0, 1.0, 0.6, key="g1"), 
+            'xgc': st.slider("Manual xGC Weight", 0.0, 1.0, 0.8, key="g_xgc"), # Added back
+            'form': st.slider("Form (PPM)", 0.0, 1.0, 0.4, key="g2"), 
+            'fix': st.slider("Fixture Impact", 0.0, 1.0, 1.0, key="g3")
+        }
     with st.sidebar.expander("🛡️ DEF Settings", expanded=False):
         w_def = {
             'ai': st.slider("AI (xGC/Stats)", 0.0, 1.0, 0.6, key="d1"), 
-            'xgc': st.slider("Manual xGC Weight", 0.0, 1.0, 0.8, key="d_xgc"), 
+            'xgc': st.slider("Manual xGC Weight", 0.0, 1.0, 0.8, key="d_xgc"), # Added back
             'form': st.slider("Form (PPM)", 0.0, 1.0, 0.4, key="d2"), 
             'fix': st.slider("Fixture Impact", 0.0, 1.0, 1.0, key="d4")
+            # Removed 'xgi' slider as requested
         }
     with st.sidebar.expander("⚔️ MID Settings", expanded=False):
         w_mid = {'ai': st.slider("AI (xG/xA/Stats)", 0.0, 1.0, 0.6, key="m1"), 'form': st.slider("Form (PPM)", 0.0, 1.0, 0.4, key="m2"), 'fix': st.slider("Fixture Impact", 0.0, 1.0, 0.8, key="m3")}
@@ -285,7 +284,6 @@ def main():
     def run_engine(p_ids, cat, w):
         cands = []
         subset = df[df['element_type'].isin(p_ids) & (df['minutes'] >= min_mins)]
-        
         if subset.empty: return pd.DataFrame()
 
         MAX_PPM = subset['points_per_game'].astype(float).max()
@@ -308,19 +306,19 @@ def main():
             raw_ppm = float(row['points_per_game'])
             score_form = (raw_ppm / MAX_PPM) * 10
             
-            # Blend Scores
-            # Defenders: AI (Base) + xGC (Manual) + Form
+            # Manual xGC (GK/DEF only)
+            score_xgc = 0
             if cat in ["GK", "DEF"]:
-                # Manual xGC Calculation (Inverted)
                 raw_xgc = float(row['expected_goals_conceded_per_90'])
                 score_xgc = max(0, min(10, (2.5 - raw_xgc) * 5))
-                
+            
+            # BLEND LOGIC (Corrected to avoid xgi error)
+            if cat in ["GK", "DEF"]:
                 base_score = (score_ai * w['ai']) + (score_xgc * w['xgc']) + (score_form * w['form'])
             else:
-                # Attackers: AI (Base) + Form
                 base_score = (score_ai * w['ai']) + (score_form * w['form'])
             
-            # Apply Context
+            # CONTEXT
             final_score = base_score * eff_mult
             
             # ROI
