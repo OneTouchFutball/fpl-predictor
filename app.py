@@ -148,6 +148,7 @@ def process_fixture_lookups(fixtures, teams_data, horizon):
     # Structure: {team_id: {'opp_att_str': [], 'opp_def_str': [], 'display': []}}
     sched = {t['id']: {'att': [], 'def': [], 'txt': []} for t in teams_data}
     
+    # Only process future fixtures
     future_fix = [f for f in fixtures if not f['finished'] and f['kickoff_time']]
     
     for f in future_fix:
@@ -239,7 +240,7 @@ def main():
     static, fixtures = get_live_data()
     teams = static['teams']
     
-    # 3. Prep Dataframe
+    # 3. Prep Dataframe (Vectorized)
     df = pd.DataFrame(static['elements'])
     df['matches_played'] = df['minutes'] / 90
     df = df[df['matches_played'] > 2.0]
@@ -350,7 +351,7 @@ def main():
         sub['ROI Index'] = (sub['roi_raw'] / sub['roi_raw'].max()) * 10
         
         # Display
-        display = sub[['ROI Index', 'web_name', 'price', 'upcoming', 'AI_Points', 'points_per_game', 'fix_display_score', stat_col]].sort_values(by='ROI Index', ascending=False).head(50)
+        display = sub[['ROI Index', 'web_name', 'price', 'upcoming', 'points_per_game', 'fix_display_score', stat_col]].sort_values(by='ROI Index', ascending=False).head(50)
         
         st.dataframe(
             display, hide_index=True, use_container_width=True,
@@ -359,9 +360,8 @@ def main():
                 "web_name": "Player",
                 "price": st.column_config.NumberColumn("£", format="£%.1f"),
                 "upcoming": st.column_config.TextColumn("Opponents", width="medium"),
-                "AI_Points": st.column_config.NumberColumn("AI Exp", format="%.2f"),
                 "points_per_game": st.column_config.NumberColumn("Form", format="%.1f"),
-                "fix_display_score": st.column_config.NumberColumn("Fix Rate", help="10=Easy"),
+                "fix_display_score": st.column_config.NumberColumn("Fixture Rating", help="10=Easy"),
                 stat_col: st.column_config.NumberColumn(stat_fmt, format="%.2f")
             }
         )
@@ -374,4 +374,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
