@@ -291,13 +291,13 @@ def main():
     # Weights Config
     ws = {}
     with st.sidebar.expander("🧤 GK Settings", expanded=False):
-        ws['GK'] = {'ai': st.slider("AI Stats", 0., 1., 0.5, key="g1"), 'xgc': st.slider("Manual xGC", 0., 1., 0.5, key="g2"), 'form': st.slider("Form", 0., 1., 0.5, key="g3"), 'fix': st.slider("Fix", 0., 1., 0.5, key="g4")}
+        ws['GK'] = {'ai': st.slider("AI Stats", 0., 1., 0.5, key="g1"), 'xgc': st.slider("Manual xGC", 0., 1., 0.5, key="g2"), 'form': st.slider("Form", 0., 1., 0.5, key="g3"), 'fix': st.slider("Fixtures", 0., 1., 0.5, key="g4")}
     with st.sidebar.expander("🛡️ DEF Settings", expanded=False):
-        ws['DEF'] = {'ai': st.slider("AI Stats", 0., 1., 0.5, key="d1"), 'xgc': st.slider("Manual xGC", 0., 1., 0.5, key="d2"), 'form': st.slider("Form", 0., 1., 0.5, key="d3"), 'fix': st.slider("Fix", 0., 1., 0.5, key="d4")}
+        ws['DEF'] = {'ai': st.slider("AI Stats", 0., 1., 0.5, key="d1"), 'xgc': st.slider("Manual xGC", 0., 1., 0.5, key="d2"), 'form': st.slider("Form", 0., 1., 0.5, key="d3"), 'fix': st.slider("Fixtures", 0., 1., 0.5, key="d4")}
     with st.sidebar.expander("⚔️ MID Settings", expanded=False):
-        ws['MID'] = {'ai': st.slider("AI Stats", 0., 1., 0.5, key="m1"), 'form': st.slider("Form", 0., 1., 0.5, key="m2"), 'fix': st.slider("Fix", 0., 1., 0.5, key="m3")}
+        ws['MID'] = {'ai': st.slider("AI Stats", 0., 1., 0.5, key="m1"), 'form': st.slider("Form", 0., 1., 0.5, key="m2"), 'fix': st.slider("Fixtures", 0., 1., 0.5, key="m3")}
     with st.sidebar.expander("⚽ FWD Settings", expanded=False):
-        ws['FWD'] = {'ai': st.slider("AI Stats", 0., 1., 0.5, key="f1"), 'form': st.slider("Form", 0., 1., 0.5, key="f2"), 'fix': st.slider("Fix", 0., 1., 0.5, key="f3")}
+        ws['FWD'] = {'ai': st.slider("AI Stats", 0., 1., 0.5, key="f1"), 'form': st.slider("Form", 0., 1., 0.5, key="f2"), 'fix': st.slider("Fixtures", 0., 1., 0.5, key="f3")}
 
     st.sidebar.divider()
     min_mins = st.sidebar.slider("Min Minutes", 0, 2500, 400)
@@ -374,3 +374,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
