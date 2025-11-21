@@ -31,6 +31,7 @@ def load_training_data():
     if os.path.exists("fpl_5_year_history.csv"):
         return pd.read_csv("fpl_5_year_history.csv")
     
+    # Fallback Downloader
     seasons = ["2020-21", "2021-22", "2022-23", "2023-24", "2024-25", "2025-26"]
     base_url = "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data"
     all_data = []
@@ -40,11 +41,12 @@ def load_training_data():
             r = requests.get(url)
             if r.status_code == 200:
                 df = pd.read_csv(io.BytesIO(r.content), on_bad_lines='skip', low_memory=False)
-                # We explicitly fetch the underlying stats we need
-                cols = ['minutes', 'total_points', 'was_home', 
-                        'expected_goals', 'expected_assists', 
-                        'expected_goals_conceded', # Critical
-                        'creativity', 'threat', 'value', 'element_type']
+                # Fetching extensive list, filtering happens in training function
+                cols = ['minutes', 'total_points', 'was_home', 'clean_sheets', 
+                        'goals_conceded', 'expected_goals', 'expected_assists', 
+                        'expected_goals_conceded',
+                        'influence', 'creativity', 'threat', 'value', 'element_type',
+                        'goals_scored', 'assists', 'saves', 'bps', 'yellow_cards']
                 existing = [c for c in cols if c in df.columns]
                 all_data.append(df[existing])
         except: pass
@@ -53,42 +55,56 @@ def load_training_data():
     return None
 
 @st.cache_resource
-def get_trained_model():
+def train_dual_models():
     df = load_training_data()
-    if df is None: return None, None, None, None
+    if df is None: return None, None, None, None, None, None
     
+    # Filter Starters (>60 mins)
     df = df[df['minutes'] > 60].copy()
     
-    # --- PURE PREDICTIVE FEATURES ---
-    # Removed: goals_scored, assists, clean_sheets, goals_conceded, influence, bps, saves.
-    # This forces the AI to rely on xStats and Threat/Creativity.
-    features = [
-        'expected_goals', 
-        'expected_assists', 
-        'expected_goals_conceded', # Now the primary defensive metric
-        'threat', 
-        'creativity',
-        'minutes', 
-        'element_type', 
-        'was_home'
+    # --- SPLIT DATASETS ---
+    df_def = df[df['element_type'].isin([1, 2])] # GK/DEF
+    df_att = df[df['element_type'].isin([3, 4])] # MID/FWD
+    
+    # --- MODEL 1: DEFENSIVE SPECIALIST ---
+    # Uses xGC to predict defense. Uses xG/xA for Fullback potential.
+    # NO Result Stats (CS/Goals/Assists) to prevent leakage.
+    feats_def = [
+        'minutes', 'was_home', 'element_type',
+        'expected_goals_conceded', # <--- The primary defensive metric
+        'influence',               # Proxy for defensive actions (CBIT)
+        'expected_goals', 'expected_assists', 'threat', 'creativity', # Attacking threat
+        'yellow_cards'
     ]
+    valid_feats_def = [f for f in feats_def if f in df_def.columns]
     
-    valid_features = [f for f in features if f in df.columns]
+    model_def = RandomForestRegressor(n_estimators=50, max_depth=10, n_jobs=-1, random_state=42)
+    model_def.fit(df_def[valid_feats_def], df_def['total_points'])
     
-    model = RandomForestRegressor(n_estimators=50, max_depth=10, n_jobs=-1, random_state=42)
-    model.fit(df[valid_features], df['total_points'])
+    # --- MODEL 2: ATTACKING SPECIALIST ---
+    # IGNORES xGC (Attackers don't care about team defense)
+    # Focuses purely on offensive underlying data
+    feats_att = [
+        'minutes', 'was_home', 'element_type',
+        'expected_goals', 'expected_assists', 
+        'threat', 'creativity', 'influence',
+        'yellow_cards'
+    ]
+    valid_feats_att = [f for f in feats_att if f in df_att.columns]
     
-    # Feature Importance
-    importance_df = pd.DataFrame({
-        'Stat': valid_features,
-        'Weight': model.feature_importances_
-    }).sort_values(by='Weight', ascending=False)
+    model_att = RandomForestRegressor(n_estimators=50, max_depth=10, n_jobs=-1, random_state=42)
+    model_att.fit(df_att[valid_feats_att], df_att['total_points'])
     
-    importance_df['Weight'] = (importance_df['Weight'] / importance_df['Weight'].sum()) * 100
+    # --- EXTRACT IMPORTANCE ---
+    imp_def = pd.DataFrame({'Stat': valid_feats_def, 'Weight': model_def.feature_importances_}).sort_values(by='Weight', ascending=False)
+    imp_def['Weight'] = (imp_def['Weight'] / imp_def['Weight'].sum()) * 100
     
-    max_ai_pts = df['total_points'].quantile(0.99)
+    imp_att = pd.DataFrame({'Stat': valid_feats_att, 'Weight': model_att.feature_importances_}).sort_values(by='Weight', ascending=False)
+    imp_att['Weight'] = (imp_att['Weight'] / imp_att['Weight'].sum()) * 100
     
-    return model, valid_features, max_ai_pts, importance_df
+    max_pts = df['total_points'].quantile(0.99)
+    
+    return model_def, valid_feats_def, model_att, valid_feats_att, max_pts, (imp_def, imp_att)
 
 # =========================================
 # 2. FIXTURE ENGINE
@@ -150,10 +166,10 @@ def main():
     st.title("🧬 FPL Pro: Hybrid Intelligence")
     
     # 1. Load & Train
-    with st.spinner("Training AI on Pure Underlying Stats (xG, xA, xGC)..."):
-        model, ai_cols, max_ai_pts, feature_weights = get_trained_model()
+    with st.spinner("Training Specialist AI Models (Defensive vs Attacking)..."):
+        model_def, feat_def, model_att, feat_att, max_ai_pts, (imp_def, imp_att) = train_dual_models()
     
-    if model is None:
+    if model_def is None:
         st.warning("⚠️ Downloading Data... (Wait 30s)")
         return
 
@@ -168,37 +184,39 @@ def main():
     df['matches_played'] = df['minutes'] / 90
     df = df[df['matches_played'] > 2.0]
     
+    # AI Input Prep
     ai_input = pd.DataFrame()
     ai_input['element_type'] = df['element_type']
     ai_input['was_home'] = 0.5
     
-    # Map Live Stats (Pure Underlying Only)
     stat_map = {
         'minutes': 'minutes',
         'expected_goals': 'expected_goals_per_90',
         'expected_assists': 'expected_assists_per_90',
         'expected_goals_conceded': 'expected_goals_conceded_per_90',
-        'creativity': 'creativity', 'threat': 'threat'
+        'influence': 'influence', 'creativity': 'creativity', 'threat': 'threat',
+        'yellow_cards': 'yellow_cards'
     }
     
     for train_col, api_col in stat_map.items():
-        if train_col in ai_cols:
+        # Check both lists to ensure we map everything needed for both models
+        if (train_col in feat_def) or (train_col in feat_att):
             if 'per_90' in api_col:
                 ai_input[train_col] = pd.to_numeric(df[api_col], errors='coerce').fillna(0)
             else:
                 ai_input[train_col] = pd.to_numeric(df[api_col], errors='coerce').fillna(0) / df['matches_played']
             
-    # AI Predict
-    df['AI_Points'] = model.predict(ai_input[ai_cols])
+    # --- DUAL PREDICTION ---
+    pred_def = model_def.predict(ai_input[feat_def])
+    pred_att = model_att.predict(ai_input[feat_att])
     
-    # --- UI: BRAIN SCAN ---
-    st.sidebar.header("🧠 AI Brain Scan")
-    st.sidebar.caption("The AI is now relying ONLY on these Predictive Stats:")
-    if feature_weights is not None:
-        st.sidebar.dataframe(
-            feature_weights.head(8).style.format({"Weight": "{:.1f}%"}), 
-            hide_index=True, use_container_width=True
-        )
+    df['AI_Points'] = np.where(df['element_type'].isin([1, 2]), pred_def, pred_att)
+    
+    # --- UI ---
+    st.sidebar.header("🧠 Dual-Brain Scan")
+    b1, b2 = st.sidebar.tabs(["Def", "Att"])
+    b1.dataframe(imp_def.head(7).style.format({"Weight": "{:.1f}%"}), hide_index=True)
+    b2.dataframe(imp_att.head(7).style.format({"Weight": "{:.1f}%"}), hide_index=True)
     
     st.sidebar.divider()
     st.sidebar.header("🔮 Horizon")
@@ -206,7 +224,6 @@ def main():
     
     st.sidebar.divider()
     st.sidebar.header("⚖️ Weights")
-    
     w_budget = st.sidebar.slider("Price Sensitivity", 0.0, 1.0, 0.5)
     
     with st.sidebar.expander("🧤 GK Settings", expanded=False):
@@ -221,7 +238,7 @@ def main():
     st.sidebar.divider()
     min_mins = st.sidebar.slider("Min Minutes", 0, 2500, 400)
 
-    # --- ENGINE ---
+    # --- HYBRID ENGINE ---
     def run_engine(p_ids, cat, w):
         cands = []
         subset = df[df['element_type'].isin(p_ids) & (df['minutes'] >= min_mins)]
@@ -230,7 +247,6 @@ def main():
         for _, row in subset.iterrows():
             tid = row['team']
             
-            # 1. CONTEXT
             if cat in ["GK", "DEF"]:
                 sched = team_sched[tid]['fut_opp_att']
                 mode = "def"
@@ -242,7 +258,7 @@ def main():
             fix_score_display = get_display_score(sched, horizon)
             fix_display = ", ".join(team_sched[tid]['display'][:horizon])
             
-            # 2. SCORES
+            # Scores
             score_ai = (row['AI_Points'] / max_ai_pts) * 10
             raw_ppm = float(row['points_per_game'])
             score_form = (raw_ppm / MAX_PPM) * 10
@@ -252,13 +268,13 @@ def main():
                 xgi = float(row['expected_goal_involvements_per_90'])
                 score_bonus = (xgi * 10) * w['xgi']
             
-            # 3. BLEND
+            # Blend
             base_score = (score_ai * w['ai']) + (score_form * w['form']) + score_bonus
             
-            # 4. CONTEXT
+            # Context
             final_score = base_score * eff_mult
             
-            # 5. ROI
+            # ROI
             price = row['now_cost'] / 10.0
             price_div = price ** w_budget
             roi = final_score / price_div
@@ -290,10 +306,10 @@ def main():
         
         if cat in ["GK", "DEF"]:
             stat_lbl = "xGC/90"
-            stat_tip = "Exp. Goals Conceded (Lower is Better). Used by AI."
+            stat_tip = "Exp. Goals Conceded (Lower is Better). Used by Def AI."
         else:
             stat_lbl = "xGI/90"
-            stat_tip = "Exp. Goal Involvement (Higher is Better). Used by AI."
+            stat_tip = "Exp. Goal Involvement (Higher is Better). Used by Att AI."
         
         st.dataframe(
             d.head(50), hide_index=True, use_container_width=True,
