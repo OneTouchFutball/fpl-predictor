@@ -14,17 +14,8 @@ st.set_page_config(page_title="FPL Pro Hybrid 25/26", page_icon="🧬", layout="
 st.markdown("""
 <style>
     .stTabs [data-baseweb="tab-list"] { gap: 8px; }
-    .stTabs [data-baseweb="tab"] {
-        height: 60px; white-space: pre-wrap; background-color: #f0f2f6;
-        border-radius: 8px 8px 0 0; padding: 10px 20px;
-        font-size: 18px; font-weight: 700; color: #4a4a4a;
-    }
-    .stTabs [data-baseweb="tab"]:hover { background-color: #e0e2e6; color: #1f77b4; }
-    .stTabs [data-baseweb="tab"][aria-selected="true"] {
-        background-color: #ffffff; border-top: 3px solid #00cc00;
-        color: #00cc00; box-shadow: 0 -2px 5px rgba(0,0,0,0.05);
-    }
-    .stButton button { width: 100%; font-weight: 600; }
+    .stTabs [data-baseweb="tab"] { height: 60px; font-weight: 700; }
+    .stTabs [data-baseweb="tab"][aria-selected="true"] { border-top: 3px solid #00cc00; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -32,28 +23,38 @@ st.markdown("""
 API_BASE = "https://fantasy.premierleague.com/api"
 
 # =========================================
-# 1. AI DATA INFRASTRUCTURE
+# 1. DATA DOWNLOADER (Runs in Foreground)
 # =========================================
 
-def download_training_data():
+def get_historical_data():
+    """
+    Checks for CSV. If missing, downloads it with a visible progress bar.
+    Returns the DataFrame.
+    """
+    # 1. Check if file exists (Fast Path)
     if os.path.exists("fpl_5_year_history.csv"):
         return pd.read_csv("fpl_5_year_history.csv")
-        
-    status = st.empty()
-    status.info("⏳ Initializing: Downloading historical data...")
+    
+    # 2. Download if missing (Slow Path)
+    st.warning("⚠️ Training Data Missing. Downloading 5 years of history... (This happens once)")
     
     seasons = ["2020-21", "2021-22", "2022-23", "2023-24", "2024-25", "2025-26"]
     base_url = "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data"
     all_data = []
     
-    for season in seasons:
+    # Progress Bar
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, season in enumerate(seasons):
+        status_text.text(f"Downloading Season: {season}...")
         try:
             url = f"{base_url}/{season}/gws/merged_gw.csv"
             r = requests.get(url)
             if r.status_code == 200:
                 df = pd.read_csv(io.BytesIO(r.content), on_bad_lines='skip', low_memory=False)
                 
-                # Extended Column List
+                # Optimize Columns to save memory
                 cols = ['minutes', 'total_points', 'was_home', 'clean_sheets', 
                         'goals_conceded', 'expected_goals', 'expected_assists', 
                         'influence', 'creativity', 'threat', 'value', 'element_type',
@@ -64,23 +65,34 @@ def download_training_data():
                 all_data.append(df)
         except: pass
         
+        # Update Bar
+        progress_bar.progress((i + 1) / len(seasons))
+        
     if all_data:
         master = pd.concat(all_data)
         master.fillna(0, inplace=True)
+        # Save for next time
         master.to_csv("fpl_5_year_history.csv", index=False)
-        status.empty()
+        
+        status_text.text("✅ Download Complete. Starting AI Training...")
+        progress_bar.empty()
         return master
+    
     return None
 
+# =========================================
+# 2. AI TRAINER (Cached)
+# =========================================
+
 @st.cache_resource
-def train_ai_model():
-    df = download_training_data()
+def train_ai_model(df):
+    # This function is cached, so it only runs when 'df' changes
     if df is None: return None, None, None
     
+    # Filter Starters (>60 mins)
     df = df[df['minutes'] > 60].copy()
     
-    # REMOVED 'value' (Price) from features. 
-    # AI now predicts purely on Performance Stats.
+    # PURE PERFORMANCE FEATURES (No Price)
     features = [
         'element_type', 'was_home', 
         'expected_goals', 'expected_assists', 'influence', 'creativity', 'threat', 
@@ -92,6 +104,7 @@ def train_ai_model():
     X = df[valid_features]
     y = df['total_points']
     
+    # Train Model
     model = HistGradientBoostingRegressor(max_iter=50, random_state=42)
     model.fit(X, y)
     
@@ -100,7 +113,7 @@ def train_ai_model():
     return model, valid_features, max_ai_pts
 
 # =========================================
-# 2. LIVE DATA & FIXTURES
+# 3. LIVE DATA LOADER
 # =========================================
 
 @st.cache_data(ttl=1800)
@@ -151,35 +164,38 @@ def min_max_scale(series):
     return ((series - min_v) / (max_v - min_v)) * 10
 
 # =========================================
-# 3. HYBRID APP LOGIC
+# 4. MAIN APP
 # =========================================
 
 def main():
     st.title("🧬 FPL Pro: Hybrid Intelligence")
-    st.markdown("### Performance-Based AI + User Context")
+    st.markdown("### Performance AI + Contextual Logic")
 
-    # 1. Train AI
-    with st.spinner("Training Pure Performance AI..."):
-        model, ai_cols, max_ai_pts = train_ai_model()
+    # 1. GET DATA (Shows Progress Bar if downloading)
+    history_df = get_historical_data()
     
-    if model is None:
-        st.error("Data Error. Please refresh.")
+    if history_df is None:
+        st.error("Critical Error: Could not download training data.")
         return
 
-    # 2. Load Live
+    # 2. TRAIN AI (Shows Spinner)
+    with st.spinner("Training AI Model on 5 Years of Data..."):
+        model, ai_cols, max_ai_pts = train_ai_model(history_df)
+
+    # 3. GET LIVE DATA
     static, fixtures = load_live_data()
     teams = static['teams']
     team_names = {t['id']: t['name'] for t in teams}
     team_sched, avg_str = process_fixtures(fixtures, teams)
     
-    # 3. Prepare Player Data
+    # 4. PREPARE LIVE STATS
     df = pd.DataFrame(static['elements'])
     df['matches_played'] = df['minutes'] / 90
     df = df[df['matches_played'] > 2.0]
     
-    # AI Input Prep
+    # Map Live API columns to Training Columns
     ai_input = pd.DataFrame()
-    # Note: NO 'value' column is added to ai_input anymore!
+    # Note: Price is NOT included in AI input
     ai_input['element_type'] = df['element_type']
     ai_input['was_home'] = 0.5
     
@@ -198,28 +214,21 @@ def main():
             if 'per_90' in api_col:
                 ai_input[train_col] = pd.to_numeric(df[api_col], errors='coerce').fillna(0)
             else:
+                # Normalize totals to per-match average
                 ai_input[train_col] = pd.to_numeric(df[api_col], errors='coerce').fillna(0) / df['matches_played']
             
-    # --- AI PREDICTION (Pure Stats) ---
+    # --- AI PREDICTION ---
     df['AI_Points'] = model.predict(ai_input[ai_cols])
     
     # --- UI CONTROLS ---
-    
-    # Transparency Check
-    with st.sidebar.expander("🧠 AI Brain Logic"):
-        st.write("The AI is predicting points based ONLY on:")
-        st.code(", ".join(ai_cols), language="text")
-        st.caption("Price is NOT used in prediction.")
-    
-    st.sidebar.divider()
     st.sidebar.header("🔮 Horizon")
     horizon = st.sidebar.selectbox("Lookahead", [1, 5, 10], format_func=lambda x: f"Next {x} Matches")
     
     st.sidebar.divider()
     st.sidebar.header("⚖️ Hybrid Weights")
     
-    # USER CONTROLS PRICE SENSITIVITY HERE
-    w_budget = st.sidebar.slider("Price Sensitivity", 0.0, 1.0, 0.5, help="0=Ignore Price (Best Players). 1=Full Value (Points per £).")
+    # PRICE SLIDER
+    w_budget = st.sidebar.slider("Price Sensitivity", 0.0, 1.0, 0.5, help="0=Best Player, 1=Best Value")
     
     st.sidebar.subheader("Position Strategy")
     
@@ -291,9 +300,8 @@ def main():
             eff_mult = 1.0 + (fix_mult - 1.0) * w['fix']
             final_score = base_score * eff_mult
             
-            # 5. ROI (USER CONTROLLED PRICE IMPACT)
+            # 5. ROI (User Controlled)
             price = row['now_cost'] / 10.0
-            # Divisor: If w_budget is 0, divide by 1 (No Impact). If 1, divide by Price.
             price_div = price ** w_budget
             roi = final_score / price_div
             
