@@ -5,7 +5,6 @@ import requests
 import io
 import os
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import LabelEncoder
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="FPL Prediction App powered by AI", page_icon="🤖", layout="wide")
@@ -23,113 +22,107 @@ st.markdown("""
 API_BASE = "https://fantasy.premierleague.com/api"
 
 # =========================================
-# 1. DATA INFRASTRUCTURE
+# 1. OPTIMIZED DATA LOADER
 # =========================================
 
 @st.cache_data(persist="disk") 
 def load_training_data():
+    """Loads historical data efficiently."""
     if os.path.exists("fpl_5_year_history.csv"):
-        df = pd.read_csv("fpl_5_year_history.csv")
-    else:
-        # Fallback Downloader
-        seasons = ["2020-21", "2021-22", "2022-23", "2023-24", "2024-25", "2025-26"]
-        base_url = "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data"
-        all_data = []
-        for season in seasons:
-            try:
-                url = f"{base_url}/{season}/gws/merged_gw.csv"
-                r = requests.get(url)
-                if r.status_code == 200:
-                    temp_df = pd.read_csv(io.BytesIO(r.content), on_bad_lines='skip', low_memory=False)
-                    
-                    cols = ['minutes', 'total_points', 'was_home', 'clean_sheets', 
-                            'goals_conceded', 'expected_goals', 'expected_assists', 
-                            'expected_goals_conceded', 'influence', 'creativity', 'threat', 
-                            'value', 'element_type', 'position', 
-                            'goals_scored', 'assists', 'saves', 'bps', 'yellow_cards']
-                    
-                    existing = [c for c in cols if c in temp_df.columns]
-                    temp_df = temp_df[existing]
-                    all_data.append(temp_df)
-            except: pass
-            
-        if all_data:
-            df = pd.concat(all_data, ignore_index=True).fillna(0)
-        else:
-            return None
-
-    # Sanitization
-    if 'element_type' not in df.columns:
-        if 'position' in df.columns:
-            pos_map = {'GK': 1, 'DEF': 2, 'MID': 3, 'FWD': 4, 'GKP': 1}
-            df['element_type'] = df['position'].map(pos_map).fillna(3).astype(int)
-        else:
-            df['element_type'] = 3
-    df['element_type'] = pd.to_numeric(df['element_type'], errors='coerce').fillna(3).astype(int)
+        return pd.read_csv("fpl_5_year_history.csv")
     
-    return df
+    # Fallback Downloader
+    seasons = ["2020-21", "2021-22", "2022-23", "2023-24", "2024-25", "2025-26"]
+    base_url = "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data"
+    all_data = []
+    
+    # Minimal columns to save memory/bandwidth during fetch
+    cols_needed = [
+        'minutes', 'total_points', 'was_home', 'clean_sheets', 
+        'goals_conceded', 'expected_goals', 'expected_assists', 
+        'expected_goals_conceded', 'influence', 'creativity', 'threat', 
+        'value', 'element_type', 'position', 
+        'goals_scored', 'assists', 'saves', 'bps', 'yellow_cards'
+    ]
+
+    for season in seasons:
+        try:
+            url = f"{base_url}/{season}/gws/merged_gw.csv"
+            r = requests.get(url)
+            if r.status_code == 200:
+                df = pd.read_csv(io.BytesIO(r.content), usecols=lambda c: c in cols_needed, on_bad_lines='skip', low_memory=False)
+                all_data.append(df)
+        except: pass
+            
+    if all_data:
+        df = pd.concat(all_data, ignore_index=True).fillna(0)
+        
+        # Vectorized Type Conversion
+        if 'element_type' not in df.columns:
+            if 'position' in df.columns:
+                pos_map = {'GK': 1, 'DEF': 2, 'MID': 3, 'FWD': 4, 'GKP': 1}
+                df['element_type'] = df['position'].map(pos_map).fillna(3)
+            else:
+                df['element_type'] = 3
+        
+        df['element_type'] = pd.to_numeric(df['element_type'], errors='coerce').fillna(3).astype(int)
+        return df
+        
+    return None
 
 @st.cache_resource
 def train_dual_models():
     df = load_training_data()
     if df is None: return None, None, None, None, None, None
     
+    # Vectorized Filtering
     if 'minutes' in df.columns:
         df = df[df['minutes'] > 60].copy()
     
-    df_def = df[df['element_type'].isin([1, 2])].copy() 
-    df_att = df[df['element_type'].isin([3, 4])].copy() 
+    # Split views
+    # Use .loc for faster slicing
+    mask_def = df['element_type'].isin([1, 2])
+    mask_att = df['element_type'].isin([3, 4])
     
+    df_def = df.loc[mask_def].copy()
+    df_att = df.loc[mask_att].copy()
+    
+    # Clean xGC
     if 'expected_goals_conceded' in df_def.columns:
         df_def = df_def[df_def['expected_goals_conceded'] > 0]
 
-    # --- MODEL 1: DEFENSIVE SPECIALIST ---
-    feats_def = [
-        'minutes', 'was_home', 'element_type',
-        'expected_goals_conceded', 
-        'influence', 
-        'threat', 'creativity', 
-        'expected_goals', 'expected_assists', 
-        'yellow_cards'
-    ]
-    valid_feats_def = [f for f in feats_def if f in df_def.columns]
+    # --- MODEL 1: DEFENSIVE ---
+    feats_def = ['minutes', 'was_home', 'element_type', 'expected_goals_conceded', 
+                 'influence', 'threat', 'creativity', 'expected_goals', 'expected_assists', 'yellow_cards']
+    valid_def = [f for f in feats_def if f in df_def.columns]
     
+    model_def = None
+    imp_def = pd.DataFrame()
     if len(df_def) > 50:
-        model_def = RandomForestRegressor(n_estimators=50, max_depth=10, n_jobs=-1, random_state=42)
-        model_def.fit(df_def[valid_feats_def], df_def['total_points'])
-        imp_def = pd.DataFrame({'Stat': valid_feats_def, 'Weight': model_def.feature_importances_}).sort_values(by='Weight', ascending=False)
+        model_def = RandomForestRegressor(n_estimators=40, max_depth=10, n_jobs=-1, random_state=42)
+        model_def.fit(df_def[valid_def], df_def['total_points'])
+        imp_def = pd.DataFrame({'Stat': valid_def, 'Weight': model_def.feature_importances_}).sort_values(by='Weight', ascending=False)
         imp_def['Weight'] = (imp_def['Weight'] / imp_def['Weight'].sum()) * 100
-    else:
-        model_def = None
-        imp_def = pd.DataFrame()
 
-    # --- MODEL 2: ATTACKING SPECIALIST ---
-    feats_att = [
-        'minutes', 'was_home', 'element_type',
-        'expected_goals', 'expected_assists', 
-        'threat', 'creativity', 
-        'yellow_cards'
-    ]
-    valid_feats_att = [f for f in feats_att if f in df_att.columns]
+    # --- MODEL 2: ATTACKING ---
+    feats_att = ['minutes', 'was_home', 'element_type', 'expected_goals', 'expected_assists', 
+                 'threat', 'creativity', 'yellow_cards']
+    valid_att = [f for f in feats_att if f in df_att.columns]
     
+    model_att = None
+    imp_att = pd.DataFrame()
     if len(df_att) > 50:
-        model_att = RandomForestRegressor(n_estimators=50, max_depth=10, n_jobs=-1, random_state=42)
-        model_att.fit(df_att[valid_feats_att], df_att['total_points'])
-        imp_att = pd.DataFrame({'Stat': valid_feats_att, 'Weight': model_att.feature_importances_}).sort_values(by='Weight', ascending=False)
+        model_att = RandomForestRegressor(n_estimators=40, max_depth=10, n_jobs=-1, random_state=42)
+        model_att.fit(df_att[valid_att], df_att['total_points'])
+        imp_att = pd.DataFrame({'Stat': valid_att, 'Weight': model_att.feature_importances_}).sort_values(by='Weight', ascending=False)
         imp_att['Weight'] = (imp_att['Weight'] / imp_att['Weight'].sum()) * 100
-    else:
-        model_att = None
-        imp_att = pd.DataFrame()
     
-    if 'total_points' in df.columns:
-        max_pts = df['total_points'].quantile(0.99)
-    else:
-        max_pts = 15.0
+    max_pts = df['total_points'].quantile(0.99) if 'total_points' in df.columns else 15.0
     
-    return model_def, valid_feats_def, model_att, valid_feats_att, max_pts, (imp_def, imp_att)
+    return model_def, valid_def, model_att, valid_att, max_pts, (imp_def, imp_att)
 
 # =========================================
-# 2. LIVE DATA & FIXTURE ENGINE
+# 2. OPTIMIZED LIVE DATA & FIXTURES
 # =========================================
 
 @st.cache_data(ttl=1800)
@@ -138,47 +131,77 @@ def get_live_data():
     fixtures = requests.get(f"{API_BASE}/fixtures/").json()
     return static, fixtures
 
-def process_fixtures(fixtures, teams_data):
+def process_fixture_lookups(fixtures, teams_data, horizon):
+    """
+    Pre-calculates fixture multipliers for all teams once.
+    Returns a Dictionary mapped by Team ID.
+    """
     team_map = {t['id']: t['short_name'] for t in teams_data}
     t_stats = {t['id']: {'att_h': t['strength_attack_home'], 'att_a': t['strength_attack_away'],
                          'def_h': t['strength_defence_home'], 'def_a': t['strength_defence_away']} 
                for t in teams_data}
     
-    team_sched = {t['id']: {'fut_opp_att': [], 'fut_opp_def': [], 'display': []} for t in teams_data}
+    # Structure: {team_id: {'opp_att_str': [], 'opp_def_str': [], 'display': []}}
+    sched = {t['id']: {'att': [], 'def': [], 'txt': []} for t in teams_data}
     
-    for f in fixtures:
-        if not f['kickoff_time'] or f['finished']: continue
+    # Only process future fixtures
+    future_fix = [f for f in fixtures if not f['finished'] and f['kickoff_time']]
+    
+    for f in future_fix:
         h, a = f['team_h'], f['team_a']
         
-        team_sched[h]['fut_opp_att'].append(t_stats[a]['att_a'])
-        team_sched[h]['fut_opp_def'].append(t_stats[a]['def_a'])
-        team_sched[h]['display'].append(f"{team_map[a]}(H)")
+        # Home Team
+        if len(sched[h]['att']) < horizon:
+            sched[h]['att'].append(t_stats[a]['att_a']) # Faces Away Att
+            sched[h]['def'].append(t_stats[a]['def_a']) # Faces Away Def
+            sched[h]['txt'].append(f"{team_map[a]}(H)")
+            
+        # Away Team
+        if len(sched[a]['att']) < horizon:
+            sched[a]['att'].append(t_stats[h]['att_h']) # Faces Home Att
+            sched[a]['def'].append(t_stats[h]['def_h']) # Faces Home Def
+            sched[a]['txt'].append(f"{team_map[h]}(A)")
+            
+    return sched, 1080.0 # Avg Strength
+
+def calc_vectorized_metrics(df, team_sched, horizon, league_avg):
+    """
+    Adds fixture metrics to the dataframe efficiently.
+    """
+    # Prepare lists for new columns
+    fix_mult_def_list = [] # For GKs/Defs (facing attack)
+    fix_mult_att_list = [] # For Mids/Fwds (facing defense)
+    fix_score_list = []
+    display_list = []
+    
+    for tid in df['team']:
+        data = team_sched.get(tid, {'att': [], 'def': [], 'txt': []})
         
-        team_sched[a]['fut_opp_att'].append(t_stats[h]['att_h'])
-        team_sched[a]['fut_opp_def'].append(t_stats[h]['def_h'])
-        team_sched[a]['display'].append(f"{team_map[h]}(A)")
+        # Calc Opponent Attack Strength (For Defenders)
+        opp_att = data['att'][:horizon]
+        avg_att = sum(opp_att)/len(opp_att) if opp_att else league_avg
+        ratio_def = league_avg / avg_att
         
-    return team_sched, 1080.0
-
-def calculate_aggressive_multiplier(schedule_list, league_avg, limit, intensity_weight, mode="def"):
-    if not schedule_list: return 1.0
-    subset = schedule_list[:limit]
-    avg_strength = sum(subset) / len(subset)
-    ratio = league_avg / avg_strength
-    base_power = 4.0 if mode == "def" else 2.0
-    final_power = base_power * (intensity_weight * 2.0)
-    return ratio ** final_power
-
-def get_display_score(schedule_list, limit):
-    if not schedule_list: return 5.0
-    avg = sum(schedule_list[:limit]) / len(schedule_list[:limit])
-    return max(0, min(10, 10 - ((avg - 950)/400 * 10)))
-
-def min_max_scale(series):
-    if series.empty: return series
-    min_v, max_v = series.min(), series.max()
-    if max_v == min_v: return pd.Series([5.0]*len(series), index=series.index)
-    return ((series - min_v) / (max_v - min_v)) * 10
+        # Calc Opponent Defense Strength (For Attackers)
+        opp_def = data['def'][:horizon]
+        avg_def = sum(opp_def)/len(opp_def) if opp_def else league_avg
+        ratio_att = league_avg / avg_def
+        
+        # Visual Score (10=Easy)
+        # Use avg of both for general difficulty display
+        raw_diff = (avg_att + avg_def) / 2
+        vis_score = max(0, min(10, 10 - ((raw_diff - 950)/400 * 10)))
+        
+        fix_mult_def_list.append(ratio_def)
+        fix_mult_att_list.append(ratio_att)
+        fix_score_list.append(round(vis_score, 1))
+        display_list.append(", ".join(data['txt'][:horizon]))
+        
+    df['fix_mult_def'] = fix_mult_def_list
+    df['fix_mult_att'] = fix_mult_att_list
+    df['fix_display_score'] = fix_score_list
+    df['upcoming'] = display_list
+    return df
 
 # =========================================
 # 3. MAIN APP
@@ -187,7 +210,7 @@ def min_max_scale(series):
 def main():
     st.title("🤖 FPL Prediction App powered by AI")
     
-    # 1. Load & Train
+    # 1. Train
     with st.spinner("Training AI Models..."):
         model_def, feat_def, model_att, feat_att, max_ai_pts, (imp_def, imp_att) = train_dual_models()
     
@@ -195,188 +218,143 @@ def main():
         st.warning("⚠️ Downloading Data... (Wait 30s)")
         return
 
-    # 2. Live Data
+    # 2. Load Live
     static, fixtures = get_live_data()
     teams = static['teams']
-    team_names = {t['id']: t['name'] for t in teams}
-    team_sched, avg_str = process_fixtures(fixtures, teams)
+    team_sched, avg_str = process_fixture_lookups(fixtures, teams)
     
-    # 3. Prepare Player Data
+    # 3. Prep Dataframe (Vectorized)
     df = pd.DataFrame(static['elements'])
     df['matches_played'] = df['minutes'] / 90
     df = df[df['matches_played'] > 2.0]
     
-    # AI Input Prep
-    ai_input = pd.DataFrame()
-    ai_input['element_type'] = df['element_type']
-    ai_input['was_home'] = 0.5
-    
-    stat_map = {
-        'minutes': 'minutes',
-        'expected_goals': 'expected_goals_per_90',
-        'expected_assists': 'expected_assists_per_90',
-        'expected_goals_conceded': 'expected_goals_conceded_per_90',
-        'influence': 'influence', 'creativity': 'creativity', 'threat': 'threat',
-        'yellow_cards': 'yellow_cards'
-    }
-    
-    for train_col, api_col in stat_map.items():
-        if (train_col in feat_def) or (train_col in feat_att):
-            if 'per_90' in api_col:
-                ai_input[train_col] = pd.to_numeric(df[api_col], errors='coerce').fillna(0)
-            else:
-                ai_input[train_col] = pd.to_numeric(df[api_col], errors='coerce').fillna(0) / df['matches_played']
-            
-    # --- DUAL PREDICTION ---
-    if model_def:
-        pred_def = model_def.predict(ai_input[feat_def])
-    else:
-        pred_def = 0
+    # Feature Prep
+    df['was_home'] = 0.5
+    # Bulk convert numeric
+    cols_to_norm = [
+        ('expected_goals', 'expected_goals_per_90'),
+        ('expected_assists', 'expected_assists_per_90'),
+        ('expected_goals_conceded', 'expected_goals_conceded_per_90'),
+        ('clean_sheets', 'clean_sheets_per_90'),
+        ('goals_conceded', 'goals_conceded_per_90')
+    ]
+    for new, old in cols_to_norm:
+        df[new] = pd.to_numeric(df[old], errors='coerce').fillna(0)
         
-    if model_att:
-        pred_att = model_att.predict(ai_input[feat_att])
-    else:
-        pred_att = 0
+    cols_to_div = ['influence', 'creativity', 'threat', 'yellow_cards']
+    for c in cols_to_div:
+        df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0) / df['matches_played']
+        
+    # 4. AI Predict
+    if model_def:
+        df['pred_def'] = model_def.predict(df[feat_def])
+    else: df['pred_def'] = 0
     
-    df['AI_Points'] = np.where(df['element_type'].isin([1, 2]), pred_def, pred_att)
+    if model_att:
+        df['pred_att'] = model_att.predict(df[feat_att])
+    else: df['pred_att'] = 0
+    
+    df['AI_Points'] = np.where(df['element_type'].isin([1, 2]), df['pred_def'], df['pred_att'])
     
     # --- UI ---
     st.sidebar.header("🧠 AI Brain Scan")
-    brain_tab1, brain_tab2 = st.sidebar.tabs(["Def", "Att"])
-    if not imp_def.empty:
-        brain_tab1.caption("Defenders (Incl. Influence):")
-        brain_tab1.dataframe(imp_def.head(7).style.format({"Weight": "{:.1f}%"}), hide_index=True)
-    if not imp_att.empty:
-        brain_tab2.caption("Attackers (Pure xStats):")
-        brain_tab2.dataframe(imp_att.head(7).style.format({"Weight": "{:.1f}%"}), hide_index=True)
+    t1, t2 = st.sidebar.tabs(["Def", "Att"])
+    if not imp_def.empty: t1.dataframe(imp_def.head(7).style.format({"Weight": "{:.1f}%"}), hide_index=True)
+    if not imp_att.empty: t2.dataframe(imp_att.head(7).style.format({"Weight": "{:.1f}%"}), hide_index=True)
     
     st.sidebar.divider()
-    st.sidebar.header("🔮 Horizon")
-    horizon = st.sidebar.selectbox("Lookahead", [1, 5, 10], format_func=lambda x: f"Next {x} Matches")
+    horizon = st.sidebar.selectbox("Horizon", [1, 5, 10], format_func=lambda x: f"Next {x} Matches")
+    
+    # 5. Calculate Fixture Metrics (Vectorized)
+    df = calc_vectorized_metrics(df, team_sched, horizon, avg_str)
     
     st.sidebar.divider()
     st.sidebar.header("⚖️ Weights")
     w_budget = st.sidebar.slider("Price Sensitivity", 0.0, 1.0, 0.0)
     
+    # Weights Config
+    ws = {}
     with st.sidebar.expander("🧤 GK Settings", expanded=False):
-        w_gk = {
-            'ai': st.slider("AI Stats", 0.0, 1.0, 0.5, key="g1"), 
-            'xgc': st.slider("Manual xGC Weight", 0.0, 1.0, 0.5, key="g_xgc"),
-            'form': st.slider("Form (PPM)", 0.0, 1.0, 0.5, key="g2"), 
-            'fix': st.slider("Fixture Impact", 0.0, 1.0, 0.5, key="g3")
-        }
+        ws['GK'] = {'ai': st.slider("AI Stats", 0., 1., 0.5, key="g1"), 'xgc': st.slider("Manual xGC", 0., 1., 0.5, key="g2"), 'form': st.slider("Form", 0., 1., 0.5, key="g3"), 'fix': st.slider("Fix", 0., 1., 0.5, key="g4")}
     with st.sidebar.expander("🛡️ DEF Settings", expanded=False):
-        w_def = {
-            'ai': st.slider("AI Stats", 0.0, 1.0, 0.5, key="d1"), 
-            'xgc': st.slider("Manual xGC Weight", 0.0, 1.0, 0.5, key="d_xgc"), 
-            'form': st.slider("Form (PPM)", 0.0, 1.0, 0.5, key="d2"), 
-            'fix': st.slider("Fixture Impact", 0.0, 1.0, 0.5, key="d4")
-        }
+        ws['DEF'] = {'ai': st.slider("AI Stats", 0., 1., 0.5, key="d1"), 'xgc': st.slider("Manual xGC", 0., 1., 0.5, key="d2"), 'form': st.slider("Form", 0., 1., 0.5, key="d3"), 'fix': st.slider("Fix", 0., 1., 0.5, key="d4")}
     with st.sidebar.expander("⚔️ MID Settings", expanded=False):
-        w_mid = {'ai': st.slider("AI Stats", 0.0, 1.0, 0.5, key="m1"), 'form': st.slider("Form (PPM)", 0.0, 1.0, 0.5, key="m2"), 'fix': st.slider("Fixture Impact", 0.0, 1.0, 0.5, key="m3")}
+        ws['MID'] = {'ai': st.slider("AI Stats", 0., 1., 0.5, key="m1"), 'form': st.slider("Form", 0., 1., 0.5, key="m2"), 'fix': st.slider("Fix", 0., 1., 0.5, key="m3")}
     with st.sidebar.expander("⚽ FWD Settings", expanded=False):
-        w_fwd = {'ai': st.slider("AI Stats", 0.0, 1.0, 0.5, key="f1"), 'form': st.slider("Form (PPM)", 0.0, 1.0, 0.5, key="f2"), 'fix': st.slider("Fixture Impact", 0.0, 1.0, 0.5, key="f3")}
+        ws['FWD'] = {'ai': st.slider("AI Stats", 0., 1., 0.5, key="f1"), 'form': st.slider("Form", 0., 1., 0.5, key="f2"), 'fix': st.slider("Fix", 0., 1., 0.5, key="f3")}
 
     st.sidebar.divider()
     min_mins = st.sidebar.slider("Min Minutes", 0, 2500, 400)
 
-    # --- ENGINE ---
-    def run_engine(p_ids, cat, w):
-        cands = []
-        subset = df[df['element_type'].isin(p_ids) & (df['minutes'] >= min_mins)]
-        if subset.empty: return pd.DataFrame()
-
-        MAX_PPM = subset['points_per_game'].astype(float).max()
+    # --- VECTORIZED HYBRID ENGINE ---
+    def render_table(pos_ids, cat, weights):
+        # 1. Filter
+        sub = df[df['element_type'].isin(pos_ids) & (df['minutes'] >= min_mins)].copy()
+        if sub.empty: st.write("No players."); return
         
-        for _, row in subset.iterrows():
-            tid = row['team']
-            
-            # 1. CONTEXT
-            if cat in ["GK", "DEF"]:
-                sched = team_sched[tid]['fut_opp_att']
-                mode = "def"
-            else:
-                sched = team_sched[tid]['fut_opp_def']
-                mode = "att"
-                
-            eff_mult = calculate_aggressive_multiplier(sched, avg_str, horizon, w['fix'], mode)
-            fix_score_display = get_display_score(sched, horizon)
-            fix_display = ", ".join(team_sched[tid]['display'][:horizon])
-            
-            # 2. SCORES
-            score_ai = (row['AI_Points'] / max_ai_pts) * 10
-            raw_ppm = float(row['points_per_game'])
-            score_form = (raw_ppm / MAX_PPM) * 10
-            
-            # Manual xGC (GK/DEF only)
-            score_xgc = 0
-            if cat in ["GK", "DEF"]:
-                raw_xgc = float(row['expected_goals_conceded_per_90'])
-                score_xgc = max(0, min(10, (2.5 - raw_xgc) * 5))
-            
-            # 3. BLEND
-            if cat in ["GK", "DEF"]:
-                base_score = (score_ai * w['ai']) + (score_xgc * w['xgc']) + (score_form * w['form'])
-            else:
-                base_score = (score_ai * w['ai']) + (score_form * w['form'])
-            
-            # 4. CONTEXT
-            final_score = base_score * eff_mult
-            
-            # 5. ROI
-            price = row['now_cost'] / 10.0
-            price_div = price ** w_budget
-            roi = final_score / price_div
-            
-            stat_disp = float(row['expected_goals_conceded_per_90']) if cat in ["GK", "DEF"] else float(row['expected_goal_involvements_per_90'])
-
-            cands.append({
-                "Name": row['web_name'],
-                "Team": team_names.get(tid, "Unknown"),
-                "Price": price,
-                "Key Stat": stat_disp,
-                "Upcoming": fix_display,
-                "AI Base": round(row['AI_Points'], 2),
-                "PPM": raw_ppm,
-                "Fix Rate": round(fix_score_display, 1),
-                "Raw ROI": roi
-            })
-            
-        res = pd.DataFrame(cands)
-        if res.empty: return res
+        # 2. Normalize Columns (Vectorized)
+        max_ppm = sub['points_per_game'].astype(float).max() or 1.0
         
-        res['ROI Index'] = min_max_scale(res['Raw ROI'])
-        return res.sort_values(by="ROI Index", ascending=False)
-
-    def render(p_ids, cat, w):
-        d = run_engine(p_ids, cat, w)
-        if d.empty: st.write("No players."); return
+        sub['norm_ai'] = (sub['AI_Points'] / max_ai_pts) * 10
+        sub['norm_form'] = (sub['points_per_game'].astype(float) / max_ppm) * 10
         
-        if cat in ["GK", "DEF"]:
-            stat_lbl = "xGC/90"
-            stat_tip = "Exp. Goals Conceded (Lower is Better)."
+        # 3. Calculate Base Score (Vectorized)
+        if cat in ['GK', 'DEF']:
+            # xGC Logic: 2.5 -> 0, 0.5 -> 10
+            sub['norm_xgc'] = (2.5 - sub['expected_goals_conceded']).clip(lower=0) * 5
+            sub['base'] = (sub['norm_ai'] * weights['ai']) + \
+                          (sub['norm_xgc'] * weights['xgc']) + \
+                          (sub['norm_form'] * weights['form'])
+            
+            # Fixture Power (Defenders = Power 4)
+            power = 4.0 * (weights['fix'] * 2.0)
+            sub['eff_fix'] = sub['fix_mult_def'] ** power
+            
+            stat_col = 'expected_goals_conceded'
+            stat_fmt = "xGC/90"
         else:
-            stat_lbl = "xGI/90"
-            stat_tip = "Exp. Goal Involvement (Higher is Better)."
+            sub['base'] = (sub['norm_ai'] * weights['ai']) + \
+                          (sub['norm_form'] * weights['form'])
+            
+            # Fixture Power (Attackers = Power 2)
+            power = 2.0 * (weights['fix'] * 2.0)
+            sub['eff_fix'] = sub['fix_mult_att'] ** power
+            
+            stat_col = 'expected_goal_involvements_per_90'
+            stat_fmt = "xGI/90"
+            
+        # 4. Final Calc
+        sub['final_score'] = sub['base'] * sub['eff_fix']
+        
+        # Price
+        sub['price'] = sub['now_cost'] / 10.0
+        sub['roi_raw'] = sub['final_score'] / (sub['price'] ** w_budget)
+        
+        # Final Normalize
+        sub['ROI Index'] = (sub['roi_raw'] / sub['roi_raw'].max()) * 10
+        
+        # Display
+        display = sub[['ROI Index', 'web_name', 'price', 'upcoming', 'AI_Points', 'points_per_game', 'fix_display_score', stat_col]].sort_values(by='ROI Index', ascending=False).head(50)
         
         st.dataframe(
-            d.head(50), hide_index=True, use_container_width=True,
+            display, hide_index=True, use_container_width=True,
             column_config={
                 "ROI Index": st.column_config.ProgressColumn("ROI Index", format="%.1f", min_value=0, max_value=10),
-                "Price": st.column_config.NumberColumn("£", format="£%.1f"),
-                "Upcoming": st.column_config.TextColumn("Opponents", width="medium"),
-                "AI Base": st.column_config.NumberColumn("AI Exp", help="Points predicted by AI"),
-                "PPM": st.column_config.NumberColumn("Form", help="Actual Points Per Match"),
-                "Fix Rate": st.column_config.NumberColumn("Fix Rating", help="10=Easy, 0=Hard"),
-                "Key Stat": st.column_config.NumberColumn(stat_lbl, format="%.2f", help=stat_tip)
+                "web_name": "Player",
+                "price": st.column_config.NumberColumn("£", format="£%.1f"),
+                "upcoming": st.column_config.TextColumn("Opponents", width="medium"),
+                "AI_Points": st.column_config.NumberColumn("AI Exp", format="%.2f"),
+                "points_per_game": st.column_config.NumberColumn("Form", format="%.1f"),
+                "fix_display_score": st.column_config.NumberColumn("Fix Rate", help="10=Easy"),
+                stat_col: st.column_config.NumberColumn(stat_fmt, format="%.2f")
             }
         )
 
     t1, t2, t3, t4 = st.tabs(["🧤 GK", "🛡️ DEF", "⚔️ MID", "⚽ FWD"])
-    with t1: render([1], "GK", w_gk)
-    with t2: render([2], "DEF", w_def)
-    with t3: render([3], "MID", w_mid)
-    with t4: render([4], "FWD", w_fwd)
+    with t1: render_table([1], "GK", ws['GK'])
+    with t2: render_table([2], "DEF", ws['DEF'])
+    with t3: render_table([3], "MID", ws['MID'])
+    with t4: render_table([4], "FWD", ws['FWD'])
 
 if __name__ == "__main__":
     main()
