@@ -27,48 +27,54 @@ API_BASE = "https://fantasy.premierleague.com/api"
 
 @st.cache_data(persist="disk") 
 def load_training_data():
-    """Loads historical data efficiently."""
+    """Loads historical data efficiently and guarantees schema safety."""
     if os.path.exists("fpl_5_year_history.csv"):
-        return pd.read_csv("fpl_5_year_history.csv")
-    
-    # Fallback Downloader
-    seasons = ["2020-21", "2021-22", "2022-23", "2023-24", "2024-25", "2025-26"]
-    base_url = "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data"
-    all_data = []
-    
-    # Minimal columns to save memory/bandwidth during fetch
-    cols_needed = [
-        'minutes', 'total_points', 'was_home', 'clean_sheets', 
-        'goals_conceded', 'expected_goals', 'expected_assists', 
-        'expected_goals_conceded', 'influence', 'creativity', 'threat', 
-        'value', 'element_type', 'position', 
-        'goals_scored', 'assists', 'saves', 'bps', 'yellow_cards'
-    ]
+        df = pd.read_csv("fpl_5_year_history.csv")
+    else:
+        # Fallback Downloader
+        seasons = ["2020-21", "2021-22", "2022-23", "2023-24", "2024-25", "2025-26"]
+        base_url = "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data"
+        all_data = []
+        
+        # Minimal columns to save memory/bandwidth
+        cols_needed = [
+            'minutes', 'total_points', 'was_home', 'clean_sheets', 
+            'goals_conceded', 'expected_goals', 'expected_assists', 
+            'expected_goals_conceded', 'influence', 'creativity', 'threat', 
+            'value', 'element_type', 'position', 
+            'goals_scored', 'assists', 'saves', 'bps', 'yellow_cards'
+        ]
 
-    for season in seasons:
-        try:
-            url = f"{base_url}/{season}/gws/merged_gw.csv"
-            r = requests.get(url)
-            if r.status_code == 200:
-                df = pd.read_csv(io.BytesIO(r.content), usecols=lambda c: c in cols_needed, on_bad_lines='skip', low_memory=False)
-                all_data.append(df)
-        except: pass
+        for season in seasons:
+            try:
+                url = f"{base_url}/{season}/gws/merged_gw.csv"
+                r = requests.get(url)
+                if r.status_code == 200:
+                    temp = pd.read_csv(io.BytesIO(r.content), on_bad_lines='skip', low_memory=False)
+                    # Select only existing columns from our needed list
+                    existing = [c for c in cols_needed if c in temp.columns]
+                    all_data.append(temp[existing])
+            except: pass
             
-    if all_data:
-        df = pd.concat(all_data, ignore_index=True).fillna(0)
-        
-        # Vectorized Type Conversion
-        if 'element_type' not in df.columns:
-            if 'position' in df.columns:
-                pos_map = {'GK': 1, 'DEF': 2, 'MID': 3, 'FWD': 4, 'GKP': 1}
-                df['element_type'] = df['position'].map(pos_map).fillna(3)
-            else:
-                df['element_type'] = 3
-        
-        df['element_type'] = pd.to_numeric(df['element_type'], errors='coerce').fillna(3).astype(int)
-        return df
-        
-    return None
+        if all_data:
+            df = pd.concat(all_data, ignore_index=True).fillna(0)
+        else:
+            return None
+
+    # --- CRITICAL FIX: ENSURE ELEMENT_TYPE EXISTS ---
+    if 'element_type' not in df.columns:
+        if 'position' in df.columns:
+            # Map text to ID
+            pos_map = {'GK': 1, 'DEF': 2, 'MID': 3, 'FWD': 4, 'GKP': 1}
+            df['element_type'] = df['position'].map(pos_map).fillna(3)
+        else:
+            # Last resort fallback
+            df['element_type'] = 3
+            
+    # Force numeric type
+    df['element_type'] = pd.to_numeric(df['element_type'], errors='coerce').fillna(3).astype(int)
+    
+    return df
 
 @st.cache_resource
 def train_dual_models():
@@ -80,14 +86,14 @@ def train_dual_models():
         df = df[df['minutes'] > 60].copy()
     
     # Split views
-    # Use .loc for faster slicing
+    # Now safe because element_type is guaranteed
     mask_def = df['element_type'].isin([1, 2])
     mask_att = df['element_type'].isin([3, 4])
     
     df_def = df.loc[mask_def].copy()
     df_att = df.loc[mask_att].copy()
     
-    # Clean xGC
+    # Clean xGC for Defenders (Remove old 0.0 data)
     if 'expected_goals_conceded' in df_def.columns:
         df_def = df_def[df_def['expected_goals_conceded'] > 0]
 
@@ -134,7 +140,6 @@ def get_live_data():
 def process_fixture_lookups(fixtures, teams_data, horizon):
     """
     Pre-calculates fixture multipliers for all teams once.
-    Returns a Dictionary mapped by Team ID.
     """
     team_map = {t['id']: t['short_name'] for t in teams_data}
     t_stats = {t['id']: {'att_h': t['strength_attack_home'], 'att_a': t['strength_attack_away'],
@@ -150,52 +155,68 @@ def process_fixture_lookups(fixtures, teams_data, horizon):
     for f in future_fix:
         h, a = f['team_h'], f['team_a']
         
-        # Home Team
+        # Process Home Team
         if len(sched[h]['att']) < horizon:
             sched[h]['att'].append(t_stats[a]['att_a']) # Faces Away Att
             sched[h]['def'].append(t_stats[a]['def_a']) # Faces Away Def
             sched[h]['txt'].append(f"{team_map[a]}(H)")
             
-        # Away Team
+        # Process Away Team
         if len(sched[a]['att']) < horizon:
             sched[a]['att'].append(t_stats[h]['att_h']) # Faces Home Att
             sched[a]['def'].append(t_stats[h]['def_h']) # Faces Home Def
             sched[a]['txt'].append(f"{team_map[h]}(A)")
             
-    return sched, 1080.0 # Avg Strength
+    # Calculate Multipliers
+    results = {}
+    # League Average ~ 1080
+    LEAGUE_AVG = 1080.0
+    
+    for tid, data in sched.items():
+        count = len(data['att'])
+        if count > 0:
+            avg_att = sum(data['att']) / count
+            avg_def = sum(data['def']) / count
+            
+            # Ratios
+            ratio_def = LEAGUE_AVG / avg_att
+            ratio_att = LEAGUE_AVG / avg_def
+            
+            # Visual Score
+            raw_diff = (avg_att + avg_def) / 2
+            vis_score = max(0, min(10, 10 - ((raw_diff - 950)/400 * 10)))
+            
+            display = ", ".join(data['txt'])
+        else:
+            ratio_def = 1.0
+            ratio_att = 1.0
+            vis_score = 5.0
+            display = "-"
+            
+        results[tid] = {
+            'mult_def': ratio_def,
+            'mult_att': ratio_att,
+            'vis_score': vis_score,
+            'display': display
+        }
+        
+    return results
 
-def calc_vectorized_metrics(df, team_sched, horizon, league_avg):
+def calc_vectorized_metrics(df, team_sched_map):
     """
     Adds fixture metrics to the dataframe efficiently.
     """
-    # Prepare lists for new columns
-    fix_mult_def_list = [] # For GKs/Defs (facing attack)
-    fix_mult_att_list = [] # For Mids/Fwds (facing defense)
+    fix_mult_def_list = []
+    fix_mult_att_list = []
     fix_score_list = []
     display_list = []
     
     for tid in df['team']:
-        data = team_sched.get(tid, {'att': [], 'def': [], 'txt': []})
-        
-        # Calc Opponent Attack Strength (For Defenders)
-        opp_att = data['att'][:horizon]
-        avg_att = sum(opp_att)/len(opp_att) if opp_att else league_avg
-        ratio_def = league_avg / avg_att
-        
-        # Calc Opponent Defense Strength (For Attackers)
-        opp_def = data['def'][:horizon]
-        avg_def = sum(opp_def)/len(opp_def) if opp_def else league_avg
-        ratio_att = league_avg / avg_def
-        
-        # Visual Score (10=Easy)
-        # Use avg of both for general difficulty display
-        raw_diff = (avg_att + avg_def) / 2
-        vis_score = max(0, min(10, 10 - ((raw_diff - 950)/400 * 10)))
-        
-        fix_mult_def_list.append(ratio_def)
-        fix_mult_att_list.append(ratio_att)
-        fix_score_list.append(round(vis_score, 1))
-        display_list.append(", ".join(data['txt'][:horizon]))
+        data = team_sched_map.get(tid, {'mult_def': 1.0, 'mult_att': 1.0, 'vis_score': 5.0, 'display': '-'})
+        fix_mult_def_list.append(data['mult_def'])
+        fix_mult_att_list.append(data['mult_att'])
+        fix_score_list.append(data['vis_score'])
+        display_list.append(data['display'])
         
     df['fix_mult_def'] = fix_mult_def_list
     df['fix_mult_att'] = fix_mult_att_list
@@ -221,7 +242,6 @@ def main():
     # 2. Load Live
     static, fixtures = get_live_data()
     teams = static['teams']
-    team_sched, avg_str = process_fixture_lookups(fixtures, teams)
     
     # 3. Prep Dataframe (Vectorized)
     df = pd.DataFrame(static['elements'])
@@ -230,7 +250,6 @@ def main():
     
     # Feature Prep
     df['was_home'] = 0.5
-    # Bulk convert numeric
     cols_to_norm = [
         ('expected_goals', 'expected_goals_per_90'),
         ('expected_assists', 'expected_assists_per_90'),
@@ -266,7 +285,8 @@ def main():
     horizon = st.sidebar.selectbox("Horizon", [1, 5, 10], format_func=lambda x: f"Next {x} Matches")
     
     # 5. Calculate Fixture Metrics (Vectorized)
-    df = calc_vectorized_metrics(df, team_sched, horizon, avg_str)
+    team_sched_map = process_fixture_lookups(fixtures, teams, horizon)
+    df = calc_vectorized_metrics(df, team_sched_map, horizon, 1080.0)
     
     st.sidebar.divider()
     st.sidebar.header("⚖️ Weights")
