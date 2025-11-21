@@ -29,14 +29,11 @@ API_BASE = "https://fantasy.premierleague.com/api"
 @st.cache_data(persist="disk") 
 def load_training_data():
     """
-    Loads historical data with strict schema enforcement.
-    Guarantees 'element_type' exists to prevent KeyErrors.
+    Loads historical data.
     """
-    # Check if file exists locally
     if os.path.exists("fpl_5_year_history.csv"):
         df = pd.read_csv("fpl_5_year_history.csv")
     else:
-        # Fallback Downloader (Only runs if file is missing)
         seasons = ["2020-21", "2021-22", "2022-23", "2023-24", "2024-25", "2025-26"]
         base_url = "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data"
         all_data = []
@@ -46,23 +43,20 @@ def load_training_data():
                 url = f"{base_url}/{season}/gws/merged_gw.csv"
                 r = requests.get(url)
                 if r.status_code == 200:
-                    # Load raw data
                     temp_df = pd.read_csv(io.BytesIO(r.content), on_bad_lines='skip', low_memory=False)
                     
-                    # --- CRITICAL FIX: COLUMN NORMALIZATION ---
-                    # We select columns if they exist, but we don't crash if they don't.
+                    # We load influence/goals here just for the dataframe, 
+                    # BUT we will NOT use them in training below.
                     desired_cols = [
                         'minutes', 'total_points', 'was_home', 'clean_sheets', 
                         'goals_conceded', 'expected_goals', 'expected_assists', 
-                        'expected_goals_conceded', 'influence', 'creativity', 'threat', 
+                        'expected_goals_conceded', 'creativity', 'threat', 
                         'value', 'element_type', 'position', 
                         'goals_scored', 'assists', 'saves', 'bps', 'yellow_cards'
                     ]
                     
-                    # Only keep columns that actually exist in this specific CSV
                     available_cols = [c for c in desired_cols if c in temp_df.columns]
                     temp_df = temp_df[available_cols]
-                    
                     all_data.append(temp_df)
             except: pass
             
@@ -71,20 +65,14 @@ def load_training_data():
         else:
             return None
 
-    # --- DATA SANITIZATION (Prevent KeyErrors) ---
-    
-    # 1. Ensure 'element_type' exists
+    # --- SANITIZATION ---
     if 'element_type' not in df.columns:
         if 'position' in df.columns:
-            # Map text to ID: GK=1, DEF=2, MID=3, FWD=4
             pos_map = {'GK': 1, 'DEF': 2, 'MID': 3, 'FWD': 4, 'GKP': 1}
-            # Map and fill NaNs with 3 (Midfielder) as fallback
             df['element_type'] = df['position'].map(pos_map).fillna(3).astype(int)
         else:
-            # If neither exists, force create dummy column
             df['element_type'] = 3
             
-    # 2. Ensure numeric types
     df['element_type'] = pd.to_numeric(df['element_type'], errors='coerce').fillna(3).astype(int)
     
     return df
@@ -94,21 +82,21 @@ def train_dual_models():
     df = load_training_data()
     if df is None: return None, None, None, None, None, None
     
-    # Filter Starters (>60 mins)
-    # Ensure minutes column exists before filtering
     if 'minutes' in df.columns:
         df = df[df['minutes'] > 60].copy()
     
     # --- SPLIT DATASETS ---
-    # This is where it crashed before. Now it won't because element_type is guaranteed.
     df_def = df[df['element_type'].isin([1, 2])] # GK/DEF
     df_att = df[df['element_type'].isin([3, 4])] # MID/FWD
     
     # --- MODEL 1: DEFENSIVE SPECIALIST ---
+    # REMOVED: influence, clean_sheets, goals_conceded, bps
+    # ADDED: xGC (Defense), Threat/Creativity (Attack Potential)
     feats_def = [
         'minutes', 'was_home', 'element_type',
-        'expected_goals_conceded', 'influence', 
-        'expected_goals', 'expected_assists', 'threat', 'creativity', 
+        'expected_goals_conceded', # PRIMARY STAT
+        'threat', 'creativity',    # SECONDARY (Fullback points)
+        'expected_goals', 'expected_assists', 
         'yellow_cards'
     ]
     valid_feats_def = [f for f in feats_def if f in df_def.columns]
@@ -123,10 +111,12 @@ def train_dual_models():
         imp_def = pd.DataFrame()
 
     # --- MODEL 2: ATTACKING SPECIALIST ---
+    # REMOVED: influence, goals_scored, assists, bps
+    # FOCUSED ON: xG, xA, Threat, Creativity
     feats_att = [
         'minutes', 'was_home', 'element_type',
         'expected_goals', 'expected_assists', 
-        'threat', 'creativity', 'influence', 
+        'threat', 'creativity', 
         'yellow_cards'
     ]
     valid_feats_att = [f for f in feats_att if f in df_att.columns]
@@ -230,17 +220,17 @@ def main():
     ai_input['element_type'] = df['element_type']
     ai_input['was_home'] = 0.5
     
-    # Map Live Stats to Training Feature Names
     stat_map = {
         'minutes': 'minutes',
         'expected_goals': 'expected_goals_per_90',
         'expected_assists': 'expected_assists_per_90',
         'expected_goals_conceded': 'expected_goals_conceded_per_90',
-        'influence': 'influence', 'creativity': 'creativity', 'threat': 'threat',
+        'creativity': 'creativity', 'threat': 'threat',
         'yellow_cards': 'yellow_cards'
     }
     
     for train_col, api_col in stat_map.items():
+        # Map columns only if they are used in the training lists
         if (train_col in feat_def) or (train_col in feat_att):
             if 'per_90' in api_col:
                 ai_input[train_col] = pd.to_numeric(df[api_col], errors='coerce').fillna(0)
@@ -252,20 +242,22 @@ def main():
         pred_def = model_def.predict(ai_input[feat_def])
     else:
         pred_def = 0
-    
+        
     if model_att:
         pred_att = model_att.predict(ai_input[feat_att])
     else:
         pred_att = 0
-        
+    
     df['AI_Points'] = np.where(df['element_type'].isin([1, 2]), pred_def, pred_att)
     
     # --- UI ---
     st.sidebar.header("🧠 Dual-Brain Scan")
     brain_tab1, brain_tab2 = st.sidebar.tabs(["Def", "Att"])
     if not imp_def.empty:
+        brain_tab1.caption("Top stats for Defenders:")
         brain_tab1.dataframe(imp_def.head(7).style.format({"Weight": "{:.1f}%"}), hide_index=True)
     if not imp_att.empty:
+        brain_tab2.caption("Top stats for Attackers:")
         brain_tab2.dataframe(imp_att.head(7).style.format({"Weight": "{:.1f}%"}), hide_index=True)
     
     st.sidebar.divider()
@@ -274,6 +266,7 @@ def main():
     
     st.sidebar.divider()
     st.sidebar.header("⚖️ Weights")
+    
     w_budget = st.sidebar.slider("Price Sensitivity", 0.0, 1.0, 0.5)
     
     with st.sidebar.expander("🧤 GK Settings", expanded=False):
@@ -288,14 +281,13 @@ def main():
     st.sidebar.divider()
     min_mins = st.sidebar.slider("Min Minutes", 0, 2500, 400)
 
-    # --- HYBRID ENGINE ---
+    # --- ENGINE ---
     def run_engine(p_ids, cat, w):
         cands = []
         subset = df[df['element_type'].isin(p_ids) & (df['minutes'] >= min_mins)]
         if subset.empty: return pd.DataFrame()
-        
+
         MAX_PPM = subset['points_per_game'].astype(float).max()
-        if MAX_PPM == 0: MAX_PPM = 1
         
         for _, row in subset.iterrows():
             tid = row['team']
@@ -347,17 +339,16 @@ def main():
         res['ROI Index'] = min_max_scale(res['Raw ROI'])
         return res.sort_values(by="ROI Index", ascending=False)
 
-    # --- RENDER ---
     def render(p_ids, cat, w):
         d = run_engine(p_ids, cat, w)
-        if d.empty: st.write("No players found matching criteria."); return
+        if d.empty: st.write("No players."); return
         
         if cat in ["GK", "DEF"]:
             stat_lbl = "xGC/90"
-            stat_tip = "Exp. Goals Conceded (Lower is Better)."
+            stat_tip = "Exp. Goals Conceded (Lower is Better). Used by Def AI."
         else:
             stat_lbl = "xGI/90"
-            stat_tip = "Exp. Goal Involvement (Higher is Better)."
+            stat_tip = "Exp. Goal Involvement (Higher is Better). Used by Att AI."
         
         st.dataframe(
             d.head(50), hide_index=True, use_container_width=True,
