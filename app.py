@@ -86,14 +86,13 @@ def train_dual_models():
         df = df[df['minutes'] > 60].copy()
     
     # Split views
-    # Now safe because element_type is guaranteed
     mask_def = df['element_type'].isin([1, 2])
     mask_att = df['element_type'].isin([3, 4])
     
     df_def = df.loc[mask_def].copy()
     df_att = df.loc[mask_att].copy()
     
-    # Clean xGC for Defenders (Remove old 0.0 data)
+    # Clean xGC for Defenders
     if 'expected_goals_conceded' in df_def.columns:
         df_def = df_def[df_def['expected_goals_conceded'] > 0]
 
@@ -149,19 +148,18 @@ def process_fixture_lookups(fixtures, teams_data, horizon):
     # Structure: {team_id: {'opp_att_str': [], 'opp_def_str': [], 'display': []}}
     sched = {t['id']: {'att': [], 'def': [], 'txt': []} for t in teams_data}
     
-    # Only process future fixtures
     future_fix = [f for f in fixtures if not f['finished'] and f['kickoff_time']]
     
     for f in future_fix:
         h, a = f['team_h'], f['team_a']
         
-        # Process Home Team
+        # Home Team
         if len(sched[h]['att']) < horizon:
             sched[h]['att'].append(t_stats[a]['att_a']) # Faces Away Att
             sched[h]['def'].append(t_stats[a]['def_a']) # Faces Away Def
             sched[h]['txt'].append(f"{team_map[a]}(H)")
             
-        # Process Away Team
+        # Away Team
         if len(sched[a]['att']) < horizon:
             sched[a]['att'].append(t_stats[h]['att_h']) # Faces Home Att
             sched[a]['def'].append(t_stats[h]['def_h']) # Faces Home Def
@@ -169,7 +167,6 @@ def process_fixture_lookups(fixtures, teams_data, horizon):
             
     # Calculate Multipliers
     results = {}
-    # League Average ~ 1080
     LEAGUE_AVG = 1080.0
     
     for tid, data in sched.items():
@@ -178,11 +175,9 @@ def process_fixture_lookups(fixtures, teams_data, horizon):
             avg_att = sum(data['att']) / count
             avg_def = sum(data['def']) / count
             
-            # Ratios
             ratio_def = LEAGUE_AVG / avg_att
             ratio_att = LEAGUE_AVG / avg_def
             
-            # Visual Score
             raw_diff = (avg_att + avg_def) / 2
             vis_score = max(0, min(10, 10 - ((raw_diff - 950)/400 * 10)))
             
@@ -212,6 +207,7 @@ def calc_vectorized_metrics(df, team_sched_map):
     display_list = []
     
     for tid in df['team']:
+        # Default to safe values if team ID missing
         data = team_sched_map.get(tid, {'mult_def': 1.0, 'mult_att': 1.0, 'vis_score': 5.0, 'display': '-'})
         fix_mult_def_list.append(data['mult_def'])
         fix_mult_att_list.append(data['mult_att'])
@@ -243,7 +239,7 @@ def main():
     static, fixtures = get_live_data()
     teams = static['teams']
     
-    # 3. Prep Dataframe (Vectorized)
+    # 3. Prep Dataframe
     df = pd.DataFrame(static['elements'])
     df['matches_played'] = df['minutes'] / 90
     df = df[df['matches_played'] > 2.0]
@@ -286,7 +282,7 @@ def main():
     
     # 5. Calculate Fixture Metrics (Vectorized)
     team_sched_map = process_fixture_lookups(fixtures, teams, horizon)
-    df = calc_vectorized_metrics(df, team_sched_map, horizon, 1080.0)
+    df = calc_vectorized_metrics(df, team_sched_map)
     
     st.sidebar.divider()
     st.sidebar.header("⚖️ Weights")
