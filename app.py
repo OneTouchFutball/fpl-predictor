@@ -148,7 +148,6 @@ def process_fixture_lookups(fixtures, teams_data, horizon):
     # Structure: {team_id: {'opp_att_str': [], 'opp_def_str': [], 'display': []}}
     sched = {t['id']: {'att': [], 'def': [], 'txt': []} for t in teams_data}
     
-    # Only process future fixtures
     future_fix = [f for f in fixtures if not f['finished'] and f['kickoff_time']]
     
     for f in future_fix:
@@ -316,12 +315,19 @@ def main():
         sub['norm_form'] = (sub['points_per_game'].astype(float) / max_ppm) * 10
         
         # 3. Calculate Base Score (Vectorized)
+        # FIX: If user sets all ability weights to 0, assume base of 10.0 so fixtures can act
         if cat in ['GK', 'DEF']:
             # xGC Logic: 2.5 -> 0, 0.5 -> 10
             sub['norm_xgc'] = (2.5 - sub['expected_goals_conceded']).clip(lower=0) * 5
-            sub['base'] = (sub['norm_ai'] * weights['ai']) + \
-                          (sub['norm_xgc'] * weights['xgc']) + \
-                          (sub['norm_form'] * weights['form'])
+            
+            sum_weights = weights['ai'] + weights['xgc'] + weights['form']
+            
+            if sum_weights == 0:
+                sub['base'] = 10.0 # Default equal footing
+            else:
+                sub['base'] = (sub['norm_ai'] * weights['ai']) + \
+                              (sub['norm_xgc'] * weights['xgc']) + \
+                              (sub['norm_form'] * weights['form'])
             
             # Fixture Power (Defenders = Power 4)
             power = 4.0 * (weights['fix'] * 2.0)
@@ -330,8 +336,13 @@ def main():
             stat_col = 'expected_goals_conceded'
             stat_fmt = "xGC/90"
         else:
-            sub['base'] = (sub['norm_ai'] * weights['ai']) + \
-                          (sub['norm_form'] * weights['form'])
+            sum_weights = weights['ai'] + weights['form']
+            
+            if sum_weights == 0:
+                sub['base'] = 10.0 # Default equal footing
+            else:
+                sub['base'] = (sub['norm_ai'] * weights['ai']) + \
+                              (sub['norm_form'] * weights['form'])
             
             # Fixture Power (Attackers = Power 2)
             power = 2.0 * (weights['fix'] * 2.0)
@@ -345,6 +356,7 @@ def main():
         
         # Price
         sub['price'] = sub['now_cost'] / 10.0
+        # If w_budget is 0, divisor is 1.
         sub['roi_raw'] = sub['final_score'] / (sub['price'] ** w_budget)
         
         # Final Normalize
