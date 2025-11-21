@@ -5,10 +5,20 @@ import requests
 import io
 import os
 from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.inspection import permutation_importance
 from sklearn.preprocessing import LabelEncoder
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="FPL Pro Hybrid 25/26", page_icon="🧬", layout="wide")
+
+# --- CUSTOM CSS ---
+st.markdown("""
+<style>
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+    .stTabs [data-baseweb="tab"] { height: 60px; font-weight: 700; }
+    .stTabs [data-baseweb="tab"][aria-selected="true"] { border-top: 3px solid #00cc00; }
+</style>
+""", unsafe_allow_html=True)
 
 # --- CONSTANTS ---
 API_BASE = "https://fantasy.premierleague.com/api"
@@ -22,7 +32,6 @@ def load_training_data():
     if os.path.exists("fpl_5_year_history.csv"):
         return pd.read_csv("fpl_5_year_history.csv")
     
-    # Fallback Downloader
     seasons = ["2020-21", "2021-22", "2022-23", "2023-24", "2024-25", "2025-26"]
     base_url = "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data"
     all_data = []
@@ -46,20 +55,50 @@ def load_training_data():
 @st.cache_resource
 def get_trained_model():
     df = load_training_data()
-    if df is None: return None, None, None
+    if df is None: return None, None, None, None
     
+    # Filter Starters (>60 mins)
     df = df[df['minutes'] > 60].copy()
-    features = ['element_type', 'was_home', 'expected_goals', 'expected_assists', 
-                'clean_sheets', 'goals_conceded', 'influence', 'creativity', 'threat',
-                'goals_scored', 'assists', 'saves', 'bps', 'yellow_cards']
+    
+    # --- FEATURES (Best predictors) ---
+    features = [
+        'minutes', 'element_type', 'was_home', 
+        'expected_goals', 'expected_assists', 
+        'clean_sheets', 'goals_conceded', 
+        'influence', 'creativity', 'threat',
+        'goals_scored', 'assists', 'saves', 'bps'
+    ]
     
     valid_features = [f for f in features if f in df.columns]
     
-    model = HistGradientBoostingRegressor(max_iter=30, max_depth=8, random_state=42)
-    model.fit(df[valid_features], df['total_points'])
+    X = df[valid_features]
+    y = df['total_points']
+    
+    # 1. TRAIN HIGH ACCURACY MODEL (HistGradientBoosting)
+    # This is generally superior to Random Forest for this data
+    model = HistGradientBoostingRegressor(max_iter=50, max_depth=8, random_state=42)
+    model.fit(X, y)
+    
+    # 2. CALCULATE BRAIN SCAN (Feature Importance)
+    # HGB doesn't give this for free, we calculate it using a subset for speed
+    # We test the model against a sample to see which features matter most
+    sample_size = min(2000, len(X))
+    X_sample = X.sample(sample_size, random_state=42)
+    y_sample = y.loc[X_sample.index]
+    
+    result = permutation_importance(model, X_sample, y_sample, n_repeats=5, random_state=42)
+    
+    importance_df = pd.DataFrame({
+        'Stat': valid_features,
+        'Weight': result.importances_mean
+    }).sort_values(by='Weight', ascending=False)
+    
+    # Normalize weights for display (0-100%)
+    importance_df['Weight'] = (importance_df['Weight'] / importance_df['Weight'].sum()) * 100
     
     max_ai_pts = df['total_points'].quantile(0.99)
-    return model, valid_features, max_ai_pts
+    
+    return model, valid_features, max_ai_pts, importance_df
 
 # =========================================
 # 2. FIXTURE ENGINE
@@ -73,7 +112,6 @@ def get_live_data():
 
 def process_fixtures(fixtures, teams_data):
     team_map = {t['id']: t['short_name'] for t in teams_data}
-    # Map Team Strengths
     t_stats = {t['id']: {'att_h': t['strength_attack_home'], 'att_a': t['strength_attack_away'],
                          'def_h': t['strength_defence_home'], 'def_a': t['strength_defence_away']} 
                for t in teams_data}
@@ -95,26 +133,12 @@ def process_fixtures(fixtures, teams_data):
     return team_sched, 1080.0
 
 def calculate_aggressive_multiplier(schedule_list, league_avg, limit, intensity_weight, mode="def"):
-    """
-    Calculates a multiplier where 'intensity_weight' controls the exponent.
-    High Intensity = Massive penalty for hard games.
-    """
     if not schedule_list: return 1.0
     subset = schedule_list[:limit]
     avg_strength = sum(subset) / len(subset)
-    
-    # Base Ratio: >1.0 (Easy), <1.0 (Hard)
     ratio = league_avg / avg_strength
-    
-    # Base Power: Defenders inherently suffer more from hard games
     base_power = 4.0 if mode == "def" else 2.0
-    
-    # Intensity: User Slider (0.0 to 1.0) scales the exponent
-    # If Slider = 1.0, Exponent = base_power * 2 (Extreme)
-    # If Slider = 0.5, Exponent = base_power (Normal)
-    # If Slider = 0.0, Exponent = 0 (Multiplier = 1.0)
     final_power = base_power * (intensity_weight * 2.0)
-    
     return ratio ** final_power
 
 def get_display_score(schedule_list, limit):
@@ -135,36 +159,37 @@ def min_max_scale(series):
 def main():
     st.title("🧬 FPL Pro: Hybrid Intelligence")
     
-    # Load Model
-    model, ai_cols, max_ai_pts = get_trained_model()
+    # 1. Load & Train
+    with st.spinner("Training High-Accuracy AI Model (HistGradientBoosting)..."):
+        model, ai_cols, max_ai_pts, feature_weights = get_trained_model()
+    
     if model is None:
         st.warning("⚠️ Downloading Data... (Wait 30s)")
         return
 
-    # Load Live Data
+    # 2. Live Data
     static, fixtures = get_live_data()
     teams = static['teams']
     team_names = {t['id']: t['name'] for t in teams}
     team_sched, avg_str = process_fixtures(fixtures, teams)
     
-    # Prepare Player Data
+    # 3. Prepare Player Data
     df = pd.DataFrame(static['elements'])
     df['matches_played'] = df['minutes'] / 90
     df = df[df['matches_played'] > 2.0]
     
-    # AI Input
     ai_input = pd.DataFrame()
     ai_input['element_type'] = df['element_type']
     ai_input['was_home'] = 0.5
     
     stat_map = {
+        'minutes': 'minutes',
         'expected_goals': 'expected_goals_per_90',
         'expected_assists': 'expected_assists_per_90',
         'clean_sheets': 'clean_sheets_per_90',
         'goals_conceded': 'goals_conceded_per_90',
         'influence': 'influence', 'creativity': 'creativity', 'threat': 'threat',
-        'goals_scored': 'goals_scored', 'assists': 'assists', 'saves': 'saves', 'bps': 'bps',
-        'yellow_cards': 'yellow_cards'
+        'goals_scored': 'goals_scored', 'assists': 'assists', 'saves': 'saves', 'bps': 'bps'
     }
     
     for train_col, api_col in stat_map.items():
@@ -177,39 +202,31 @@ def main():
     # AI Predict
     df['AI_Points'] = model.predict(ai_input[ai_cols])
     
-    # --- UI ---
+    # --- UI: AI BRAIN SCAN ---
+    st.sidebar.header("🧠 AI Brain Scan")
+    st.sidebar.caption("The Boosting Model analyzed 15 stats. Here is exactly what it found important:")
+    
+    if feature_weights is not None:
+        chart_data = feature_weights.set_index("Stat")
+        st.sidebar.bar_chart(chart_data, color="#00cc00")
+    
+    st.sidebar.divider()
     st.sidebar.header("🔮 Horizon")
     horizon = st.sidebar.selectbox("Lookahead", [1, 5, 10], format_func=lambda x: f"Next {x} Matches")
     
     st.sidebar.divider()
     st.sidebar.header("⚖️ Weights")
+    
     w_budget = st.sidebar.slider("Price Sensitivity", 0.0, 1.0, 0.5)
     
     with st.sidebar.expander("🧤 GK Settings", expanded=False):
-        w_gk = {
-            'ai': st.slider("AI Stats", 0.0, 1.0, 0.6, key="g1"),
-            'form': st.slider("Form (PPM)", 0.0, 1.0, 0.4, key="g2"),
-            'fix': st.slider("Fixture Impact", 0.0, 1.0, 0.8, help="1.0 = Extreme Penalty for Hard Games", key="g3")
-        }
+        w_gk = {'ai': st.slider("AI", 0.0, 1.0, 0.6, key="g1"), 'form': st.slider("Form", 0.0, 1.0, 0.4, key="g2"), 'fix': st.slider("Fix", 0.0, 1.0, 1.0, key="g3")}
     with st.sidebar.expander("🛡️ DEF Settings", expanded=False):
-        w_def = {
-            'ai': st.slider("AI Stats", 0.0, 1.0, 0.6, key="d1"),
-            'form': st.slider("Form (PPM)", 0.0, 1.0, 0.4, key="d2"),
-            'xgi': st.slider("Att Bonus", 0.0, 1.0, 0.3, key="d3"),
-            'fix': st.slider("Fixture Impact", 0.0, 1.0, 0.8, help="1.0 = Clean Sheets wiped out vs Elite teams", key="d4")
-        }
+        w_def = {'ai': st.slider("AI", 0.0, 1.0, 0.6, key="d1"), 'form': st.slider("Form", 0.0, 1.0, 0.4, key="d2"), 'xgi': st.slider("Att", 0.0, 1.0, 0.3, key="d3"), 'fix': st.slider("Fix", 0.0, 1.0, 1.0, key="d4")}
     with st.sidebar.expander("⚔️ MID Settings", expanded=False):
-        w_mid = {
-            'ai': st.slider("AI Stats", 0.0, 1.0, 0.6, key="m1"),
-            'form': st.slider("Form (PPM)", 0.0, 1.0, 0.4, key="m2"),
-            'fix': st.slider("Fixture Impact", 0.0, 1.0, 0.6, key="m3")
-        }
+        w_mid = {'ai': st.slider("AI", 0.0, 1.0, 0.6, key="m1"), 'form': st.slider("Form", 0.0, 1.0, 0.4, key="m2"), 'fix': st.slider("Fix", 0.0, 1.0, 0.8, key="m3")}
     with st.sidebar.expander("⚽ FWD Settings", expanded=False):
-        w_fwd = {
-            'ai': st.slider("AI Stats", 0.0, 1.0, 0.6, key="f1"),
-            'form': st.slider("Form (PPM)", 0.0, 1.0, 0.4, key="f2"),
-            'fix': st.slider("Fixture Impact", 0.0, 1.0, 0.6, key="f3")
-        }
+        w_fwd = {'ai': st.slider("AI", 0.0, 1.0, 0.6, key="f1"), 'form': st.slider("Form", 0.0, 1.0, 0.4, key="f2"), 'fix': st.slider("Fix", 0.0, 1.0, 0.8, key="f3")}
 
     st.sidebar.divider()
     min_mins = st.sidebar.slider("Min Minutes", 0, 2500, 400)
@@ -230,11 +247,7 @@ def main():
                 sched = team_sched[tid]['fut_opp_def']
                 mode = "att"
                 
-            # --- AGGRESSIVE MULTIPLIER CALCULATION ---
-            # We pass the user slider (w['fix']) as the intensity_weight
             eff_mult = calculate_aggressive_multiplier(sched, avg_str, horizon, w['fix'], mode)
-            
-            # Visual Score
             fix_score_display = get_display_score(sched, horizon)
             fix_display = ", ".join(team_sched[tid]['display'][:horizon])
             
@@ -251,7 +264,7 @@ def main():
             # Blend
             base_score = (score_ai * w['ai']) + (score_form * w['form']) + score_bonus
             
-            # Apply Aggressive Context
+            # Apply Context
             final_score = base_score * eff_mult
             
             # ROI
