@@ -42,37 +42,19 @@ def load_training_data():
             if r.status_code == 200:
                 df = pd.read_csv(io.BytesIO(r.content), on_bad_lines='skip', low_memory=False)
                 
-                # --- FIX: ROBUST COLUMN SELECTION ---
-                # We need these columns. We grab whatever is available.
-                target_cols = [
-                    'minutes', 'total_points', 'was_home', 'clean_sheets', 
-                    'goals_conceded', 'expected_goals', 'expected_assists', 
-                    'expected_goals_conceded', 'influence', 'creativity', 'threat', 
-                    'value', 'element_type', 'position', # Grab 'position' as backup
-                    'goals_scored', 'assists', 'saves', 'bps', 'yellow_cards'
-                ]
+                # Targets we WANT, but we will check existence later
+                cols = ['minutes', 'total_points', 'was_home', 'clean_sheets', 
+                        'goals_conceded', 'expected_goals', 'expected_assists', 
+                        'expected_goals_conceded', 'influence', 'creativity', 'threat', 
+                        'value', 'element_type', 'position', 
+                        'goals_scored', 'assists', 'saves', 'bps', 'yellow_cards']
                 
-                # Intersection of what we want vs what exists
-                existing = [c for c in target_cols if c in df.columns]
-                df = df[existing]
-                
-                all_data.append(df)
+                existing = [c for c in cols if c in df.columns]
+                all_data.append(df[existing])
         except: pass
         
     if all_data:
-        master_df = pd.concat(all_data).fillna(0)
-        
-        # --- CRITICAL FIX FOR KEY ERROR ---
-        # If 'element_type' is missing but 'position' exists (GK/DEF/MID/FWD), map it.
-        if 'element_type' not in master_df.columns and 'position' in master_df.columns:
-            pos_map = {'GK': 1, 'DEF': 2, 'MID': 3, 'FWD': 4, 'GKP': 1}
-            master_df['element_type'] = master_df['position'].map(pos_map).fillna(0)
-            
-        # Fallback: If neither exists, drop rows (bad data) or assume MID(3)
-        if 'element_type' not in master_df.columns:
-             master_df['element_type'] = 3 
-             
-        return master_df
+        return pd.concat(all_data).fillna(0)
     return None
 
 @st.cache_resource
@@ -80,11 +62,24 @@ def train_dual_models():
     df = load_training_data()
     if df is None: return None, None, None, None, None, None
     
-    # Filter Starters (>60 mins)
-    df = df[df['minutes'] > 60].copy()
-    
-    # Ensure numeric types for filtering
+    # --- SAFE DATA CLEANING ---
+    # Fix 'element_type' missing issue
+    if 'element_type' not in df.columns:
+        if 'position' in df.columns:
+            # Map text positions to ID
+            pos_map = {'GK': 1, 'DEF': 2, 'MID': 3, 'FWD': 4, 'GKP': 1}
+            df['element_type'] = df['position'].map(pos_map).fillna(0)
+        else:
+            # If absolutely nothing exists, we can't train split models.
+            # Create a dummy column to prevent crash (all players treated same)
+            df['element_type'] = 3
+            
+    # Ensure numeric
     df['element_type'] = pd.to_numeric(df['element_type'], errors='coerce').fillna(0)
+    
+    # Filter Starters (>60 mins)
+    if 'minutes' in df.columns:
+        df = df[df['minutes'] > 60].copy()
     
     # --- SPLIT DATASETS ---
     df_def = df[df['element_type'].isin([1, 2])] # GK/DEF
@@ -99,7 +94,7 @@ def train_dual_models():
     ]
     valid_feats_def = [f for f in feats_def if f in df_def.columns]
     
-    if len(df_def) > 100: # Only train if enough data
+    if len(df_def) > 50:
         model_def = RandomForestRegressor(n_estimators=50, max_depth=10, n_jobs=-1, random_state=42)
         model_def.fit(df_def[valid_feats_def], df_def['total_points'])
         imp_def = pd.DataFrame({'Stat': valid_feats_def, 'Weight': model_def.feature_importances_}).sort_values(by='Weight', ascending=False)
@@ -117,7 +112,7 @@ def train_dual_models():
     ]
     valid_feats_att = [f for f in feats_att if f in df_att.columns]
     
-    if len(df_att) > 100:
+    if len(df_att) > 50:
         model_att = RandomForestRegressor(n_estimators=50, max_depth=10, n_jobs=-1, random_state=42)
         model_att.fit(df_att[valid_feats_att], df_att['total_points'])
         imp_att = pd.DataFrame({'Stat': valid_feats_att, 'Weight': model_att.feature_importances_}).sort_values(by='Weight', ascending=False)
@@ -126,7 +121,10 @@ def train_dual_models():
         model_att = None
         imp_att = pd.DataFrame()
     
-    max_pts = df['total_points'].quantile(0.99)
+    if 'total_points' in df.columns:
+        max_pts = df['total_points'].quantile(0.99)
+    else:
+        max_pts = 15.0 # Fallback
     
     return model_def, valid_feats_def, model_att, valid_feats_att, max_pts, (imp_def, imp_att)
 
@@ -208,7 +206,7 @@ def main():
     df['matches_played'] = df['minutes'] / 90
     df = df[df['matches_played'] > 2.0]
     
-    # AI Input Prep (Universal Mapping)
+    # AI Input Prep
     ai_input = pd.DataFrame()
     ai_input['element_type'] = df['element_type']
     ai_input['was_home'] = 0.5
@@ -223,16 +221,24 @@ def main():
     }
     
     for train_col, api_col in stat_map.items():
-        needed = (train_col in feat_def) or (train_col in feat_att)
-        if needed:
+        if (train_col in feat_def) or (train_col in feat_att):
             if 'per_90' in api_col:
                 ai_input[train_col] = pd.to_numeric(df[api_col], errors='coerce').fillna(0)
             else:
                 ai_input[train_col] = pd.to_numeric(df[api_col], errors='coerce').fillna(0) / df['matches_played']
             
     # --- DUAL PREDICTION ---
-    pred_def = model_def.predict(ai_input[feat_def])
-    pred_att = model_att.predict(ai_input[feat_att])
+    # Predict assuming Defender
+    if model_def:
+        pred_def = model_def.predict(ai_input[feat_def])
+    else:
+        pred_def = 0
+        
+    # Predict assuming Attacker
+    if model_att:
+        pred_att = model_att.predict(ai_input[feat_att])
+    else:
+        pred_att = 0
     
     df['AI_Points'] = np.where(df['element_type'].isin([1, 2]), pred_def, pred_att)
     
@@ -265,7 +271,7 @@ def main():
     st.sidebar.divider()
     min_mins = st.sidebar.slider("Min Minutes", 0, 2500, 400)
 
-    # --- HYBRID ENGINE ---
+    # --- ENGINE ---
     def run_engine(p_ids, cat, w):
         cands = []
         subset = df[df['element_type'].isin(p_ids) & (df['minutes'] >= min_mins)]
@@ -285,7 +291,6 @@ def main():
             fix_score_display = get_display_score(sched, horizon)
             fix_display = ", ".join(team_sched[tid]['display'][:horizon])
             
-            # Scores
             score_ai = (row['AI_Points'] / max_ai_pts) * 10
             raw_ppm = float(row['points_per_game'])
             score_form = (raw_ppm / MAX_PPM) * 10
@@ -295,13 +300,9 @@ def main():
                 xgi = float(row['expected_goal_involvements_per_90'])
                 score_bonus = (xgi * 10) * w['xgi']
             
-            # Blend
             base_score = (score_ai * w['ai']) + (score_form * w['form']) + score_bonus
-            
-            # Context
             final_score = base_score * eff_mult
             
-            # ROI
             price = row['now_cost'] / 10.0
             price_div = price ** w_budget
             roi = final_score / price_div
@@ -326,7 +327,6 @@ def main():
         res['ROI Index'] = min_max_scale(res['Raw ROI'])
         return res.sort_values(by="ROI Index", ascending=False)
 
-    # --- RENDER ---
     def render(p_ids, cat, w):
         d = run_engine(p_ids, cat, w)
         if d.empty: st.write("No players."); return
