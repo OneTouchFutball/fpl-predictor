@@ -23,97 +23,57 @@ st.markdown("""
 API_BASE = "https://fantasy.premierleague.com/api"
 
 # =========================================
-# 1. DATA DOWNLOADER (Runs in Foreground)
-# =========================================
-
-def get_historical_data():
-    """
-    Checks for CSV. If missing, downloads it with a visible progress bar.
-    Returns the DataFrame.
-    """
-    # 1. Check if file exists (Fast Path)
-    if os.path.exists("fpl_5_year_history.csv"):
-        return pd.read_csv("fpl_5_year_history.csv")
-    
-    # 2. Download if missing (Slow Path)
-    st.warning("⚠️ Training Data Missing. Downloading 5 years of history... (This happens once)")
-    
-    seasons = ["2020-21", "2021-22", "2022-23", "2023-24", "2024-25", "2025-26"]
-    base_url = "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data"
-    all_data = []
-    
-    # Progress Bar
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    for i, season in enumerate(seasons):
-        status_text.text(f"Downloading Season: {season}...")
-        try:
-            url = f"{base_url}/{season}/gws/merged_gw.csv"
-            r = requests.get(url)
-            if r.status_code == 200:
-                df = pd.read_csv(io.BytesIO(r.content), on_bad_lines='skip', low_memory=False)
-                
-                # Optimize Columns to save memory
-                cols = ['minutes', 'total_points', 'was_home', 'clean_sheets', 
-                        'goals_conceded', 'expected_goals', 'expected_assists', 
-                        'influence', 'creativity', 'threat', 'value', 'element_type',
-                        'goals_scored', 'assists', 'saves', 'bps', 'yellow_cards']
-                
-                existing = [c for c in cols if c in df.columns]
-                df = df[existing]
-                all_data.append(df)
-        except: pass
-        
-        # Update Bar
-        progress_bar.progress((i + 1) / len(seasons))
-        
-    if all_data:
-        master = pd.concat(all_data)
-        master.fillna(0, inplace=True)
-        # Save for next time
-        master.to_csv("fpl_5_year_history.csv", index=False)
-        
-        status_text.text("✅ Download Complete. Starting AI Training...")
-        progress_bar.empty()
-        return master
-    
-    return None
-
-# =========================================
-# 2. AI TRAINER (Cached)
+# 1. LIGHTWEIGHT AI ENGINE
 # =========================================
 
 @st.cache_resource
-def train_ai_model(df):
-    # This function is cached, so it only runs when 'df' changes
-    if df is None: return None, None, None
-    
-    # Filter Starters (>60 mins)
+def get_trained_model():
+    """
+    Trains the AI. Optimized for speed and low memory.
+    """
+    # 1. FAST LOAD: Check if your GitHub file exists
+    if os.path.exists("fpl_5_year_history.csv"):
+        # Load specific columns only to save RAM
+        cols = ['minutes', 'total_points', 'was_home', 'clean_sheets', 
+                'goals_conceded', 'expected_goals', 'expected_assists', 
+                'influence', 'creativity', 'threat', 'value', 'element_type',
+                'goals_scored', 'assists', 'saves', 'bps', 'yellow_cards']
+        
+        try:
+            df = pd.read_csv("fpl_5_year_history.csv", usecols=cols, dtype={'total_points': 'float32'})
+        except ValueError:
+            # Fallback if columns don't match perfectly
+            df = pd.read_csv("fpl_5_year_history.csv")
+    else:
+        return None, None, "FILE_NOT_FOUND"
+
+    # 2. FAST PROCESSING: Filter Starters Only
+    # We only train on players who played > 60 mins. This reduces rows significantly.
     df = df[df['minutes'] > 60].copy()
     
-    # PURE PERFORMANCE FEATURES (No Price)
-    features = [
-        'element_type', 'was_home', 
-        'expected_goals', 'expected_assists', 'influence', 'creativity', 'threat', 
-        'clean_sheets', 'goals_conceded', 'saves', 'bps', 
-        'goals_scored', 'assists', 'yellow_cards'
-    ]
+    # Features
+    features = ['element_type', 'was_home', 'expected_goals', 'expected_assists', 
+                'clean_sheets', 'goals_conceded', 'influence', 'creativity', 'threat',
+                'goals_scored', 'assists', 'saves', 'bps', 'yellow_cards']
     
+    # Validate columns exist
     valid_features = [f for f in features if f in df.columns]
+    
     X = df[valid_features]
     y = df['total_points']
     
-    # Train Model
-    model = HistGradientBoostingRegressor(max_iter=50, random_state=42)
+    # 3. FAST TRAINING: Reduced complexity for Cloud compatibility
+    # max_iter=30 is enough for FPL patterns (diminishing returns after that)
+    model = HistGradientBoostingRegressor(max_iter=30, max_depth=5, random_state=42)
     model.fit(X, y)
     
+    # Calculate max points for normalization
     max_ai_pts = df['total_points'].quantile(0.99)
     
     return model, valid_features, max_ai_pts
 
 # =========================================
-# 3. LIVE DATA LOADER
+# 2. LIVE DATA & FIXTURES
 # =========================================
 
 @st.cache_data(ttl=1800)
@@ -164,38 +124,35 @@ def min_max_scale(series):
     return ((series - min_v) / (max_v - min_v)) * 10
 
 # =========================================
-# 4. MAIN APP
+# 3. MAIN APP
 # =========================================
 
 def main():
     st.title("🧬 FPL Pro: Hybrid Intelligence")
-    st.markdown("### Performance AI + Contextual Logic")
-
-    # 1. GET DATA (Shows Progress Bar if downloading)
-    history_df = get_historical_data()
     
-    if history_df is None:
-        st.error("Critical Error: Could not download training data.")
+    # 1. Load & Train (Fast)
+    model_status = st.empty()
+    
+    # Check if model is already cached
+    model, ai_cols, max_ai_pts = get_trained_model()
+    
+    if max_ai_pts == "FILE_NOT_FOUND":
+        st.error("❌ `fpl_5_year_history.csv` not found in repository.")
+        st.info("Please upload the CSV file to your GitHub folder.")
         return
-
-    # 2. TRAIN AI (Shows Spinner)
-    with st.spinner("Training AI Model on 5 Years of Data..."):
-        model, ai_cols, max_ai_pts = train_ai_model(history_df)
-
-    # 3. GET LIVE DATA
+    
+    # 2. Load Live Data
     static, fixtures = load_live_data()
     teams = static['teams']
     team_names = {t['id']: t['name'] for t in teams}
     team_sched, avg_str = process_fixtures(fixtures, teams)
     
-    # 4. PREPARE LIVE STATS
+    # 3. Prepare Player Data
     df = pd.DataFrame(static['elements'])
     df['matches_played'] = df['minutes'] / 90
     df = df[df['matches_played'] > 2.0]
     
-    # Map Live API columns to Training Columns
     ai_input = pd.DataFrame()
-    # Note: Price is NOT included in AI input
     ai_input['element_type'] = df['element_type']
     ai_input['was_home'] = 0.5
     
@@ -214,56 +171,34 @@ def main():
             if 'per_90' in api_col:
                 ai_input[train_col] = pd.to_numeric(df[api_col], errors='coerce').fillna(0)
             else:
-                # Normalize totals to per-match average
                 ai_input[train_col] = pd.to_numeric(df[api_col], errors='coerce').fillna(0) / df['matches_played']
             
-    # --- AI PREDICTION ---
+    # AI Prediction
     df['AI_Points'] = model.predict(ai_input[ai_cols])
     
-    # --- UI CONTROLS ---
+    # --- UI ---
     st.sidebar.header("🔮 Horizon")
     horizon = st.sidebar.selectbox("Lookahead", [1, 5, 10], format_func=lambda x: f"Next {x} Matches")
     
     st.sidebar.divider()
-    st.sidebar.header("⚖️ Hybrid Weights")
+    st.sidebar.header("⚖️ Weights")
     
-    # PRICE SLIDER
-    w_budget = st.sidebar.slider("Price Sensitivity", 0.0, 1.0, 0.5, help="0=Best Player, 1=Best Value")
+    w_budget = st.sidebar.slider("Price Sensitivity", 0.0, 1.0, 0.5)
     
-    st.sidebar.subheader("Position Strategy")
-    
-    # SLIDERS
-    with st.sidebar.expander("🧤 Goalkeepers", expanded=False):
-        w_gk = {
-            'ai': st.slider("AI Stats", 0.0, 1.0, 0.6, key="g1"),
-            'form': st.slider("Form (PPM)", 0.0, 1.0, 0.4, key="g2"),
-            'fix': st.slider("Fixture Impact", 0.0, 1.0, 1.0, key="g3")
-        }
-    with st.sidebar.expander("🛡️ Defenders", expanded=False):
-        w_def = {
-            'ai': st.slider("AI Stats", 0.0, 1.0, 0.6, key="d1"),
-            'form': st.slider("Form (PPM)", 0.0, 1.0, 0.4, key="d2"),
-            'xgi': st.slider("Attacking Bonus", 0.0, 1.0, 0.3, key="d3"),
-            'fix': st.slider("Fixture Impact", 0.0, 1.0, 1.0, key="d4")
-        }
-    with st.sidebar.expander("⚔️ Midfielders", expanded=False):
-        w_mid = {
-            'ai': st.slider("AI Stats", 0.0, 1.0, 0.6, key="m1"),
-            'form': st.slider("Form (PPM)", 0.0, 1.0, 0.4, key="m2"),
-            'fix': st.slider("Fixture Impact", 0.0, 1.0, 0.8, key="m3")
-        }
-    with st.sidebar.expander("⚽ Forwards", expanded=False):
-        w_fwd = {
-            'ai': st.slider("AI Stats", 0.0, 1.0, 0.6, key="f1"),
-            'form': st.slider("Form (PPM)", 0.0, 1.0, 0.4, key="f2"),
-            'fix': st.slider("Fixture Impact", 0.0, 1.0, 0.8, key="f3")
-        }
+    with st.sidebar.expander("🧤 GK Settings", expanded=False):
+        w_gk = {'ai': st.slider("AI", 0.0, 1.0, 0.6, key="g1"), 'form': st.slider("Form", 0.0, 1.0, 0.4, key="g2"), 'fix': st.slider("Fix", 0.0, 1.0, 1.0, key="g3")}
+    with st.sidebar.expander("🛡️ DEF Settings", expanded=False):
+        w_def = {'ai': st.slider("AI", 0.0, 1.0, 0.6, key="d1"), 'form': st.slider("Form", 0.0, 1.0, 0.4, key="d2"), 'xgi': st.slider("Att", 0.0, 1.0, 0.3, key="d3"), 'fix': st.slider("Fix", 0.0, 1.0, 1.0, key="d4")}
+    with st.sidebar.expander("⚔️ MID Settings", expanded=False):
+        w_mid = {'ai': st.slider("AI", 0.0, 1.0, 0.6, key="m1"), 'form': st.slider("Form", 0.0, 1.0, 0.4, key="m2"), 'fix': st.slider("Fix", 0.0, 1.0, 0.8, key="m3")}
+    with st.sidebar.expander("⚽ FWD Settings", expanded=False):
+        w_fwd = {'ai': st.slider("AI", 0.0, 1.0, 0.6, key="f1"), 'form': st.slider("Form", 0.0, 1.0, 0.4, key="f2"), 'fix': st.slider("Fix", 0.0, 1.0, 0.8, key="f3")}
 
     st.sidebar.divider()
     min_mins = st.sidebar.slider("Min Minutes", 0, 2500, 400)
 
     # --- HYBRID ENGINE ---
-    def run_hybrid_engine(p_ids, cat, w):
+    def run_engine(p_ids, cat, w):
         cands = []
         subset = df[df['element_type'].isin(p_ids) & (df['minutes'] >= min_mins)]
         MAX_PPM = subset['points_per_game'].astype(float).max()
@@ -271,7 +206,6 @@ def main():
         for _, row in subset.iterrows():
             tid = row['team']
             
-            # 1. CONTEXT
             if cat in ["GK", "DEF"]:
                 sched = team_sched[tid]['fut_opp_att']
                 mode = "def"
@@ -283,7 +217,7 @@ def main():
             fix_score_display = get_display_score(sched, horizon)
             fix_display = ", ".join(team_sched[tid]['display'][:horizon])
             
-            # 2. HYBRID CALCULATION
+            # Scores
             score_ai = (row['AI_Points'] / max_ai_pts) * 10
             raw_ppm = float(row['points_per_game'])
             score_form = (raw_ppm / MAX_PPM) * 10
@@ -293,14 +227,14 @@ def main():
                 xgi = float(row['expected_goal_involvements_per_90'])
                 score_bonus = (xgi * 10) * w['xgi']
             
-            # 3. BLEND
+            # Blend
             base_score = (score_ai * w['ai']) + (score_form * w['form']) + score_bonus
             
-            # 4. APPLY CONTEXT
+            # Context
             eff_mult = 1.0 + (fix_mult - 1.0) * w['fix']
             final_score = base_score * eff_mult
             
-            # 5. ROI (User Controlled)
+            # ROI
             price = row['now_cost'] / 10.0
             price_div = price ** w_budget
             roi = final_score / price_div
@@ -327,7 +261,7 @@ def main():
 
     # --- RENDER ---
     def render(p_ids, cat, w):
-        d = run_hybrid_engine(p_ids, cat, w)
+        d = run_engine(p_ids, cat, w)
         if d.empty: st.write("No players."); return
         
         stat_lbl = "CS/90" if cat in ["GK", "DEF"] else "xGI/90"
@@ -338,8 +272,8 @@ def main():
                 "ROI Index": st.column_config.ProgressColumn("ROI Index", format="%.1f", min_value=0, max_value=10),
                 "Price": st.column_config.NumberColumn("£", format="£%.1f"),
                 "Upcoming": st.column_config.TextColumn("Opponents", width="medium"),
-                "AI Base": st.column_config.NumberColumn("AI Exp", help="Points predicted by AI using Pure Performance Stats"),
-                "PPM": st.column_config.NumberColumn("Form", help="Actual Points Per Match this season"),
+                "AI Base": st.column_config.NumberColumn("AI Exp", help="Points predicted by AI stats"),
+                "PPM": st.column_config.NumberColumn("Form", help="Actual Points Per Match"),
                 "Fix Rate": st.column_config.NumberColumn("Fix Rating", help="10=Easy, 0=Hard"),
                 "Key Stat": st.column_config.NumberColumn(stat_lbl, format="%.2f")
             }
