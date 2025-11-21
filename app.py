@@ -53,7 +53,7 @@ def download_training_data():
             if r.status_code == 200:
                 df = pd.read_csv(io.BytesIO(r.content), on_bad_lines='skip', low_memory=False)
                 
-                # Extended Column List (Actuals + Expected)
+                # Extended Column List
                 cols = ['minutes', 'total_points', 'was_home', 'clean_sheets', 
                         'goals_conceded', 'expected_goals', 'expected_assists', 
                         'influence', 'creativity', 'threat', 'value', 'element_type',
@@ -79,20 +79,19 @@ def train_ai_model():
     
     df = df[df['minutes'] > 60].copy()
     
-    # FULL FEATURE LIST (Let the AI Decide)
-    # We include Actuals (Goals/Assists) AND Underlying (xG/xA/ICT)
+    # REMOVED 'value' (Price) from features. 
+    # AI now predicts purely on Performance Stats.
     features = [
-        'value', 'element_type', 'was_home', 
-        'expected_goals', 'expected_assists', 'influence', 'creativity', 'threat', # Underlying
-        'clean_sheets', 'goals_conceded', 'saves', 'bps', # Defensive/Bonus Actuals
-        'goals_scored', 'assists', 'yellow_cards' # Attacking/Discipline Actuals
+        'element_type', 'was_home', 
+        'expected_goals', 'expected_assists', 'influence', 'creativity', 'threat', 
+        'clean_sheets', 'goals_conceded', 'saves', 'bps', 
+        'goals_scored', 'assists', 'yellow_cards'
     ]
     
     valid_features = [f for f in features if f in df.columns]
     X = df[valid_features]
     y = df['total_points']
     
-    # HistGradientBoosting is excellent at ignoring irrelevant features
     model = HistGradientBoostingRegressor(max_iter=50, random_state=42)
     model.fit(X, y)
     
@@ -157,10 +156,10 @@ def min_max_scale(series):
 
 def main():
     st.title("🧬 FPL Pro: Hybrid Intelligence")
-    st.markdown("### Unrestricted AI + Contextual Logic")
+    st.markdown("### Performance-Based AI + User Context")
 
     # 1. Train AI
-    with st.spinner("AI is analyzing 15+ stats across 5 years..."):
+    with st.spinner("Training Pure Performance AI..."):
         model, ai_cols, max_ai_pts = train_ai_model()
     
     if model is None:
@@ -180,11 +179,10 @@ def main():
     
     # AI Input Prep
     ai_input = pd.DataFrame()
-    ai_input['value'] = df['now_cost']
+    # Note: NO 'value' column is added to ai_input anymore!
     ai_input['element_type'] = df['element_type']
     ai_input['was_home'] = 0.5
     
-    # Map API Columns to Training Columns
     stat_map = {
         'expected_goals': 'expected_goals_per_90',
         'expected_assists': 'expected_assists_per_90',
@@ -200,20 +198,18 @@ def main():
             if 'per_90' in api_col:
                 ai_input[train_col] = pd.to_numeric(df[api_col], errors='coerce').fillna(0)
             else:
-                # Normalize totals to per-match average for accurate prediction
                 ai_input[train_col] = pd.to_numeric(df[api_col], errors='coerce').fillna(0) / df['matches_played']
             
-    # --- AI PREDICTION ---
+    # --- AI PREDICTION (Pure Stats) ---
     df['AI_Points'] = model.predict(ai_input[ai_cols])
     
     # --- UI CONTROLS ---
     
-    # Sidebar: Feature Importance (For Transparency)
-    st.sidebar.header("🧠 AI Brain Scan")
-    st.sidebar.caption("Features used by AI (Ranked by Importance):")
-    # Note: HistGradient doesn't always expose straightforward importance arrays in older sklearn versions,
-    # so we list the features the AI has access to.
-    st.sidebar.code("xG, xA, ICT, Clean Sheets,\nGoals, Assists, Saves, BPS...", language="text")
+    # Transparency Check
+    with st.sidebar.expander("🧠 AI Brain Logic"):
+        st.write("The AI is predicting points based ONLY on:")
+        st.code(", ".join(ai_cols), language="text")
+        st.caption("Price is NOT used in prediction.")
     
     st.sidebar.divider()
     st.sidebar.header("🔮 Horizon")
@@ -222,7 +218,8 @@ def main():
     st.sidebar.divider()
     st.sidebar.header("⚖️ Hybrid Weights")
     
-    w_budget = st.sidebar.slider("Price Sensitivity", 0.0, 1.0, 0.5)
+    # USER CONTROLS PRICE SENSITIVITY HERE
+    w_budget = st.sidebar.slider("Price Sensitivity", 0.0, 1.0, 0.5, help="0=Ignore Price (Best Players). 1=Full Value (Points per £).")
     
     st.sidebar.subheader("Position Strategy")
     
@@ -277,7 +274,7 @@ def main():
             fix_score_display = get_display_score(sched, horizon)
             fix_display = ", ".join(team_sched[tid]['display'][:horizon])
             
-            # 2. SCORES
+            # 2. HYBRID CALCULATION
             score_ai = (row['AI_Points'] / max_ai_pts) * 10
             raw_ppm = float(row['points_per_game'])
             score_form = (raw_ppm / MAX_PPM) * 10
@@ -294,8 +291,9 @@ def main():
             eff_mult = 1.0 + (fix_mult - 1.0) * w['fix']
             final_score = base_score * eff_mult
             
-            # 5. ROI
+            # 5. ROI (USER CONTROLLED PRICE IMPACT)
             price = row['now_cost'] / 10.0
+            # Divisor: If w_budget is 0, divide by 1 (No Impact). If 1, divide by Price.
             price_div = price ** w_budget
             roi = final_score / price_div
             
@@ -332,7 +330,7 @@ def main():
                 "ROI Index": st.column_config.ProgressColumn("ROI Index", format="%.1f", min_value=0, max_value=10),
                 "Price": st.column_config.NumberColumn("£", format="£%.1f"),
                 "Upcoming": st.column_config.TextColumn("Opponents", width="medium"),
-                "AI Base": st.column_config.NumberColumn("AI Exp", help="Points predicted by AI using ALL Stats (Actual + Underlying)"),
+                "AI Base": st.column_config.NumberColumn("AI Exp", help="Points predicted by AI using Pure Performance Stats"),
                 "PPM": st.column_config.NumberColumn("Form", help="Actual Points Per Match this season"),
                 "Fix Rate": st.column_config.NumberColumn("Fix Rating", help="10=Easy, 0=Hard"),
                 "Key Stat": st.column_config.NumberColumn(stat_lbl, format="%.2f")
